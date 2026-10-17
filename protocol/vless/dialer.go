@@ -3,6 +3,7 @@ package vless
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
@@ -38,6 +39,9 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 	flow := header.Feature1
 	switch flow {
+	case XRV + "-udp443":
+		flow = XRV
+		fallthrough
 	case XRV:
 		if !metadata.IsClient {
 			return nil, fmt.Errorf("unsupported server mode xtls flow type: %v", flow)
@@ -96,9 +100,27 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 		}
 		if d.flow == XRV {
 			if d.xudp {
-				return vision.NewPacketConn(conn, d.key, magicNetwork.Network, addr)
+				pc, err := vision.NewPacketConn(conn, d.key, magicNetwork.Network, addr)
+				if err != nil {
+					return nil, err
+				}
+				if magicNetwork.Network == "tcp" && d.metadata.IsClient {
+					time.AfterFunc(100*time.Millisecond, func() {
+						_ = pc.FlushHandshakeIfNeeded()
+					})
+				}
+				return pc, nil
 			}
-			return vision.NewConn(conn, d.key)
+			vc, err := vision.NewConn(conn, d.key)
+			if err != nil {
+				return nil, err
+			}
+			if magicNetwork.Network == "tcp" && d.metadata.IsClient {
+				time.AfterFunc(100*time.Millisecond, func() {
+					_ = vc.FlushHandshakeIfNeeded()
+				})
+			}
+			return vc, nil
 		}
 		return conn, nil
 	default:

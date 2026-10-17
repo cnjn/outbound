@@ -309,6 +309,19 @@ func (vc *Conn) Write(p []byte) (int, error) {
 	return vc.writer.Write(p)
 }
 
+// FlushHandshakeIfNeeded sends an empty-content long-padded Vision handshake
+// frame if the client has not written any payload yet (e.g., server-speaks-first
+// TCP protocols), matching Xray-core's 500ms timeout fallback without bypassing
+// Vision framing on vless.Conn.
+func (vc *Conn) FlushHandshakeIfNeeded() error {
+	vc.muWrite.Lock()
+	defer vc.muWrite.Unlock()
+	if !vc.needHandshake {
+		return nil
+	}
+	return vc.write(nil)
+}
+
 // // ReadFrom implements io.ReaderFrom.
 // func (vc *Conn) ReadFrom(r io.Reader) (n int64, err error) {
 // 	if !vc.writer.writeDirect {
@@ -340,21 +353,35 @@ func (vc *Conn) Write(p []byte) (int, error) {
 // 	return n, err
 // }
 
+// writePadding encodes one Vision frame ([UUID][command][contentLen][paddingLen][p][padding])
+// and writes it to w in a single Write call so the outer TLS/REALITY connection
+// emits one TLS record per Vision frame (matching Xray-core's XtlsPadding),
+// instead of iout.MultiWrite splitting frames <= 4096 bytes into three records.
+func writePadding(w io.Writer, p []byte, command byte, userUUID []byte, longPadding bool) error {
+	prefix, suffix := ApplyPaddingFromPool(p, command, userUUID, longPadding)
+	defer prefix.Put()
+	defer suffix.Put()
+	frame := pool.Get(len(prefix) + len(p) + len(suffix))
+	defer frame.Put()
+	n := copy(frame, prefix)
+	n += copy(frame[n:], p)
+	copy(frame[n:], suffix)
+	_, err := iout.WriteFull(w, frame)
+	return err
+}
+
 func (vc *Conn) write(p []byte) (err error) {
 	if vc.needHandshake {
-		var prefix, suffix pool.PB
 		vc.needHandshake = false
+		longPadding := false
 		if len(p) == 0 {
-			prefix, suffix = ApplyPaddingFromPool(p, commandPaddingContinue, vc.userUUID, false)
+			longPadding = true
 		} else {
 			vc.FilterTLS(p)
 			// logrus.Println("isTLS", vc.isTLS)
-			prefix, suffix = ApplyPaddingFromPool(p, commandPaddingContinue, vc.userUUID, vc.filterSnapshot().isTLS)
+			longPadding = vc.filterSnapshot().isTLS
 		}
-		defer prefix.Put()
-		defer suffix.Put()
-		_, err = iout.MultiWrite(vc.writer, prefix, p, suffix)
-		if err != nil {
+		if err = writePadding(vc.writer, p, commandPaddingContinue, vc.userUUID, longPadding); err != nil {
 			return err
 		}
 		if tlsConn, ok := vc.tlsConn.(*gotls.Conn); ok {
@@ -373,68 +400,77 @@ func (vc *Conn) write(p []byte) (err error) {
 	}
 
 	if vc.writeFilterApplicationData {
+		isComplete := isCompleteRecord(p)
 		p, p2 := ReshapeBytes(p)
 		vc.FilterTLS(p)
+		if p2 != nil {
+			vc.FilterTLS(p2)
+		}
 		// logrus.Println("isTLS2:", vc.isTLS, len(p), len(p2))
 		sn := vc.filterSnapshot()
-		command := commandPaddingContinue
 		if !sn.isTLS {
-			command = commandPaddingEnd
-
 			// disable XTLS
 			//vc.readProcess = false
 			vc.writeFilterApplicationData = false
 			vc.stopFilteringLocked()
-		} else if len(p) > 6 && bytes.Equal(p[:3], tlsApplicationDataStart) || sn.packetsToFilter <= 0 {
-			command = commandPaddingEnd
-			if sn.enableXTLS {
-				command = commandPaddingDirect
-				vc.toWriteDirect = true
-			}
-			vc.writeFilterApplicationData = false
-		}
-		// logrus.Println("command", commandPaddingDirect, "vc.writer.toWriteDirect", vc.writer.toWriteDirect)
-		prefix, suffix := ApplyPaddingFromPool(p, command, nil, sn.isTLS)
-		defer prefix.Put()
-		defer suffix.Put()
-		_, err = iout.MultiWrite(vc.writer, prefix, p, suffix)
-		if err != nil {
-			return err
-		}
-		// logrus.Println("command 2", commandPaddingDirect, "vc.writer.toWriteDirect", vc.writer.toWriteDirect)
-
-		if vc.toWriteDirect {
-			vc.writer.writeDirect = true
-			// logrus.Infoln("XTLS Vision direct write start")
-			// 	//time.Sleep(5 * time.Millisecond)
-		}
-		if p2 != nil {
-			if vc.toWriteDirect || !sn.isTLS {
-				_, err = vc.writer.Write(p2)
+			if err = writePadding(vc.writer, p, commandPaddingEnd, nil, false); err != nil {
 				return err
 			}
-			vc.FilterTLS(p)
-			// logrus.Println("isTLS3", vc.isTLS)
-			sn = vc.filterSnapshot()
-			command = commandPaddingContinue
-			if len(p) > 6 && bytes.Equal(p[:3], tlsApplicationDataStart) || sn.packetsToFilter <= 0 {
+			if p2 != nil {
+				_, err = iout.WriteFull(vc.writer, p2)
+			}
+			return err
+		}
+
+		chunks := [2][]byte{p, p2}
+		chunkCount := 1
+		if p2 != nil {
+			chunkCount = 2
+		}
+		longPadding := sn.isTLS
+		for i := 0; i < chunkCount; i++ {
+			chunk := chunks[i]
+			isLast := i == chunkCount-1
+			if len(chunk) >= 6 && bytes.Equal(chunk[:3], tlsApplicationDataStart) && isComplete {
+				if sn.enableXTLS {
+					vc.toWriteDirect = true
+				}
+				command := commandPaddingContinue
+				if isLast {
+					command = commandPaddingEnd
+					if sn.enableXTLS {
+						command = commandPaddingDirect
+					}
+				}
+				if err = writePadding(vc.writer, chunk, command, nil, true); err != nil {
+					return err
+				}
+				vc.writeFilterApplicationData = false
+				longPadding = false
+				continue
+			} else if !sn.isTLS12orAbove && sn.packetsToFilter <= 1 {
+				vc.writeFilterApplicationData = false
+				if err = writePadding(vc.writer, chunk, commandPaddingEnd, nil, longPadding); err != nil {
+					return err
+				}
+				if !isLast {
+					_, err = iout.WriteFull(vc.writer, chunks[i+1])
+				}
+				break
+			}
+			command := commandPaddingContinue
+			if isLast && !vc.writeFilterApplicationData {
 				command = commandPaddingEnd
 				if sn.enableXTLS {
 					command = commandPaddingDirect
-					vc.toWriteDirect = true
 				}
-				vc.writeFilterApplicationData = false
 			}
-			// logrus.Println("command", commandPaddingDirect)
-			prefix2, suffix2 := ApplyPaddingFromPool(p2, command, nil, sn.isTLS)
-			defer prefix2.Put()
-			defer suffix2.Put()
-			_, err = iout.MultiWrite(vc.writer, prefix2, p2, suffix2)
-			if vc.toWriteDirect {
-				vc.writer.writeDirect = true
-				// logrus.Debugln("XTLS Vision direct write start")
-				// 	//time.Sleep(10 * time.Millisecond)
+			if err = writePadding(vc.writer, chunk, command, nil, longPadding); err != nil {
+				return err
 			}
+		}
+		if vc.toWriteDirect {
+			vc.writer.writeDirect = true
 		}
 		return err
 	}
