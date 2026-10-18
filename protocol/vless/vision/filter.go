@@ -65,50 +65,24 @@ func (vc *Conn) filterSnapshot() filterSnapshot {
 	}
 }
 
-// isCompleteRecord reports whether b consists solely of one or more complete
-// TLS ApplicationData (0x17 0x03 0x03) records, matching Xray-core's
-// IsCompleteRecord guard before switching to CommandPaddingDirect/End.
-func isCompleteRecord(b []byte) bool {
+// isCompleteAppDataRecords reports whether b consists solely of one or more
+// complete TLS ApplicationData (0x17 0x03 0x03) records. Invariant: Vision must
+// never switch to Direct mode in the middle of a record.
+func isCompleteAppDataRecords(b []byte) bool {
 	if len(b) < 6 {
 		return false
 	}
-	headerLen := 5
-	recordLen := 0
-	totalLen := len(b)
-	i := 0
-	for i < totalLen {
-		// record header: 0x17 0x03 0x03 + 2 bytes length
-		if headerLen > 0 {
-			data := b[i]
-			i++
-			switch headerLen {
-			case 5:
-				if data != 0x17 {
-					return false
-				}
-			case 4, 3:
-				if data != 0x03 {
-					return false
-				}
-			case 2:
-				recordLen = int(data) << 8
-			case 1:
-				recordLen = recordLen | int(data)
-			}
-			headerLen--
-		} else if recordLen > 0 {
-			remaining := totalLen - i
-			if remaining < recordLen {
-				return false
-			}
-			i += recordLen
-			recordLen = 0
-			headerLen = 5
-		} else {
+	for len(b) > 0 {
+		if len(b) < 5 || !bytes.Equal(b[:3], tlsApplicationDataStart) {
 			return false
 		}
+		recordLen := int(binary.BigEndian.Uint16(b[3:5]))
+		if recordLen == 0 || len(b)-5 < recordLen {
+			return false
+		}
+		b = b[5+recordLen:]
 	}
-	return headerLen == 5 && recordLen == 0
+	return true
 }
 
 func (vc *Conn) filterTLSLocked(buffer []byte) (index int) {

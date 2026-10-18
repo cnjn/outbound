@@ -65,6 +65,10 @@ func NewConn(conn netproxy.Conn, metadata Metadata, cmdKey []byte) (c *Conn, err
 		}
 		c.cachedProxyAddrIpIP = proxyAddrIp.AddrPort()
 	}
+	// Vision streams must open with a padded Vision frame carrying the user
+	// UUID; a raw empty write here would emit an unpadded VLESS header alone,
+	// so vision.NewPacketConn owns the 100ms handshake-flush timer when a
+	// flow is active.
 	if metadata.Network == "tcp" && metadata.IsClient && metadata.Flow == "" {
 		time.AfterFunc(100*time.Millisecond, func() {
 			// avoid the situation where the server sends messages first.
@@ -148,17 +152,6 @@ func (c *Conn) write(b []byte) (n int, err error) {
 		if c.metadata.IsClient {
 			header := c.reqHeader()
 			defer pool.Put(header)
-			if c.metadata.Flow == XRV && len(b) > 0 && len(header)+len(b) <= 32768 {
-				merged := pool.Get(len(header) + len(b))
-				defer pool.Put(merged)
-				copy(merged, header)
-				copy(merged[len(header):], b)
-				if _, err = c.Conn.Write(merged); err != nil {
-					return 0, fmt.Errorf("write header: %w", err)
-				}
-				c.onceWrite = true
-				return len(b), nil
-			}
 			buffers := net.Buffers{header}
 			if len(b) > 0 {
 				buffers = append(buffers, b)
@@ -169,9 +162,6 @@ func (c *Conn) write(b []byte) (n int, err error) {
 			c.onceWrite = true
 			return len(b), nil
 		}
-	}
-	if len(b) == 0 {
-		return 0, nil
 	}
 	return c.Conn.Write(b)
 }

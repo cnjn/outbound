@@ -3,15 +3,30 @@ package vision
 
 import (
 	"errors"
+	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 )
 
 var ErrNotTLS13 = errors.New("XTLS Vision based on TLS 1.3 outer connection")
 
+// handshakeFlushDelay matches vless.NewConn's 100ms server-speaks-first
+// fallback: if the client has not written within 100ms of dialing a TCP
+// stream, flush an empty long-padded Vision handshake frame so the VLESS
+// request header and initial Vision frame reach the server together.
+const handshakeFlushDelay = 100 * time.Millisecond
+
 func NewPacketConn(conn netproxy.Conn, userUUID []byte, network string, addr string) (*PacketConn, error) {
 	c, err := NewConn(conn, userUUID)
-	return &PacketConn{Conn: c, network: network, addr: addr}, err
+	if err != nil {
+		return nil, err
+	}
+	if network == "tcp" {
+		c.handshakeTimer = time.AfterFunc(handshakeFlushDelay, func() {
+			_ = c.flushHandshakeIfNeeded()
+		})
+	}
+	return &PacketConn{Conn: c, network: network, addr: addr}, nil
 }
 
 func NewConn(conn netproxy.Conn, userUUID []byte) (*Conn, error) {

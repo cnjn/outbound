@@ -3,7 +3,6 @@ package vless
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
@@ -99,28 +98,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			return nil, err
 		}
 		if d.flow == XRV {
-			if d.xudp {
-				pc, err := vision.NewPacketConn(conn, d.key, magicNetwork.Network, addr)
-				if err != nil {
-					return nil, err
-				}
-				if magicNetwork.Network == "tcp" && d.metadata.IsClient {
-					time.AfterFunc(100*time.Millisecond, func() {
-						_ = pc.FlushHandshakeIfNeeded()
-					})
-				}
-				return pc, nil
-			}
-			vc, err := vision.NewConn(conn, d.key)
-			if err != nil {
-				return nil, err
-			}
-			if magicNetwork.Network == "tcp" && d.metadata.IsClient {
-				time.AfterFunc(100*time.Millisecond, func() {
-					_ = vc.FlushHandshakeIfNeeded()
-				})
-			}
-			return vc, nil
+			return vision.NewPacketConn(conn, d.key, magicNetwork.Network, addr)
 		}
 		return conn, nil
 	default:
