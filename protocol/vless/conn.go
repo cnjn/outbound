@@ -65,7 +65,11 @@ func NewConn(conn netproxy.Conn, metadata Metadata, cmdKey []byte) (c *Conn, err
 		}
 		c.cachedProxyAddrIpIP = proxyAddrIp.AddrPort()
 	}
-	if metadata.Network == "tcp" && metadata.IsClient {
+	// Vision streams must open with a padded Vision frame carrying the user
+	// UUID; a raw empty write here would emit an unpadded VLESS header alone,
+	// so vision.NewPacketConn owns the 100ms handshake-flush timer when a
+	// flow is active.
+	if metadata.Network == "tcp" && metadata.IsClient && metadata.Flow == "" {
 		time.AfterFunc(100*time.Millisecond, func() {
 			// avoid the situation where the server sends messages first.
 			// Use a local error: capturing the named return here would race

@@ -46,6 +46,7 @@ func (vc *Conn) stopFilteringLocked() {
 type filterSnapshot struct {
 	packetsToFilter int
 	isTLS           bool
+	isTLS12orAbove  bool
 	enableXTLS      bool
 }
 
@@ -59,8 +60,29 @@ func (vc *Conn) filterSnapshot() filterSnapshot {
 	return filterSnapshot{
 		packetsToFilter: vc.packetsToFilter,
 		isTLS:           vc.isTLS,
+		isTLS12orAbove:  vc.isTLS12orAbove,
 		enableXTLS:      vc.enableXTLS,
 	}
+}
+
+// isCompleteAppDataRecords reports whether b consists solely of one or more
+// complete TLS ApplicationData (0x17 0x03 0x03) records. Invariant: Vision must
+// never switch to Direct mode in the middle of a record.
+func isCompleteAppDataRecords(b []byte) bool {
+	if len(b) < 6 {
+		return false
+	}
+	for len(b) > 0 {
+		if len(b) < 5 || !bytes.Equal(b[:3], tlsApplicationDataStart) {
+			return false
+		}
+		recordLen := int(binary.BigEndian.Uint16(b[3:5]))
+		if recordLen == 0 || len(b)-5 < recordLen {
+			return false
+		}
+		b = b[5+recordLen:]
+	}
+	return true
 }
 
 func (vc *Conn) filterTLSLocked(buffer []byte) (index int) {

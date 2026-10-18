@@ -38,6 +38,9 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	}
 	flow := header.Feature1
 	switch flow {
+	case XRV + "-udp443":
+		flow = XRV
+		fallthrough
 	case XRV:
 		if !metadata.IsClient {
 			return nil, fmt.Errorf("unsupported server mode xtls flow type: %v", flow)
@@ -95,10 +98,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 			return nil, err
 		}
 		if d.flow == XRV {
-			if d.xudp {
-				return vision.NewPacketConn(conn, d.key, magicNetwork.Network, addr)
-			}
-			return vision.NewConn(conn, d.key)
+			return vision.NewPacketConn(conn, d.key, magicNetwork.Network, addr)
 		}
 		return conn, nil
 	default:

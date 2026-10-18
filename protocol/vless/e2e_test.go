@@ -1033,6 +1033,193 @@ func TestE2EVlessVisionTCPRelayOverTLS(t *testing.T) {
 	}
 }
 
+// serveVisionDirectTCPRelay simulates a real Xray-core server handling an
+// inner TLS 1.3 connection over Vision: once either side sends a frame with
+// commandPaddingDirect (0x02), that leg switches from the outer TLS connection
+// directly to the underlying raw TCP connection (DirectCopy/Splice) for all
+// subsequent inner TLS 1.3 ApplicationData records.
+func serveVisionDirectTCPRelay(t *testing.T, cfg *serverConfig, tc *tls.Conn, rawConn net.Conn, br *bufio.Reader, rec requestRecord, clientUUID [16]byte) {
+	t.Helper()
+	destination := net.JoinHostPort(rec.host, strconv.Itoa(int(rec.port)))
+	target, err := net.DialTimeout("tcp", destination, 10*time.Second)
+	if err != nil {
+		return
+	}
+	defer target.Close()
+	if err := writeResponseHeader(tc); err != nil {
+		return
+	}
+	reader := &visionFrameReader{br: br, cfg: cfg, wantUUID: clientUUID}
+	go func() {
+		for {
+			cmd, content, err := reader.readFrame()
+			if err != nil {
+				return
+			}
+			if _, err := target.Write(content); err != nil {
+				return
+			}
+			if cmd == visionCmdDirect {
+				// Drain any buffered outer TLS plaintext, then read raw inner
+				// TLS records directly from rawConn (matching Xray-core's
+				// DirectCopy uplink transition).
+				if br.Buffered() > 0 {
+					_, _ = io.CopyN(target, br, int64(br.Buffered()))
+				}
+				_, _ = io.Copy(target, rawConn)
+				if tcp, ok := target.(*net.TCPConn); ok {
+					_ = tcp.CloseWrite()
+				}
+				return
+			}
+			if cmd == visionCmdEnd {
+				_, _ = io.Copy(target, br)
+				if tcp, ok := target.(*net.TCPConn); ok {
+					_ = tcp.CloseWrite()
+				}
+				return
+			}
+		}
+	}()
+	first := true
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := target.Read(buf)
+		if n > 0 {
+			chunk := buf[:n]
+			cmd := visionCmdContinue
+			if len(chunk) >= 6 && bytes.Equal(chunk[:3], []byte{0x17, 0x03, 0x03}) {
+				cmd = visionCmdDirect
+			}
+			if werr := writeVisionFrame(tc, first, clientUUID, cmd, chunk, 32); werr != nil {
+				return
+			}
+			first = false
+			if cmd == visionCmdDirect {
+				_, _ = io.Copy(rawConn, target)
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// TestE2EVlessVisionInnerTLS13DirectCopy runs a real inner TLS 1.3 handshake
+// and data transfer inside an outer TLS 1.3 VLESS+Vision tunnel, verifying
+// that:
+//  1. Inner TLS 1.3 ChangeCipherSpec + Finished stays on commandPaddingContinue
+//     and does not prematurely trigger DirectCopy;
+//  2. The first inner TLS 1.3 ApplicationData record triggers commandPaddingDirect
+//     and cleanly transitions both directions to raw underlay DirectCopy.
+func TestE2EVlessVisionInnerTLS13DirectCopy(t *testing.T) {
+	// Start an inner TLS 1.3 echo target (simulating an HTTPS origin on :443).
+	rawTargetLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("inner tls listen: %v", err)
+	}
+	innerTargetLn := tls.NewListener(rawTargetLn, &tls.Config{
+		Certificates: []tls.Certificate{e2eSelfSignedCert(t)},
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+	})
+	t.Cleanup(func() { _ = innerTargetLn.Close() })
+	go func() {
+		for {
+			c, err := innerTargetLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				_, _ = io.Copy(c, c)
+			}(c)
+		}
+	}()
+
+	uuidA := "6b3b0a6c-9b7e-4f1d-8c2a-3f5e1d7b9c01"
+	cfg := &serverConfig{
+		allowedUUIDs: map[[16]byte]struct{}{uuidKey(t, uuidA): {}},
+		wantFlow:     vlessFlowVision,
+		vision:       true,
+	}
+	outerRawLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("outer listen: %v", err)
+	}
+	t.Cleanup(func() { _ = outerRawLn.Close() })
+	outerTLSConfig := &tls.Config{
+		Certificates: []tls.Certificate{e2eSelfSignedCert(t)},
+		MinVersion:   tls.VersionTLS13,
+		MaxVersion:   tls.VersionTLS13,
+	}
+	go func() {
+		for {
+			rawConn, err := outerRawLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(rawConn net.Conn) {
+				defer rawConn.Close()
+				_ = rawConn.SetDeadline(time.Now().Add(serverDeadline))
+				tc := tls.Server(rawConn, outerTLSConfig)
+				if err := tc.Handshake(); err != nil {
+					return
+				}
+				br := bufio.NewReaderSize(tc, 32<<10)
+				rec, err := readVlessRequest(br, cfg)
+				if err != nil {
+					return
+				}
+				cfg.stats.addRequest(rec)
+				serveVisionDirectTCPRelay(t, cfg, tc, rawConn, br, rec, rec.uuid)
+			}(rawConn)
+		}
+	}()
+
+	d := newVlessClientDialer(t, outerRawLn.Addr().String(), uuidA, vless.XRV, true)
+	ctx := deadlineCtx(t)
+	tunnelConn, err := d.DialContext(ctx, "tcp", innerTargetLn.Addr().String())
+	if err != nil {
+		t.Fatalf("dial tunnel: %v", err)
+	}
+	defer tunnelConn.Close()
+
+	// Perform a real inner TLS 1.3 handshake over the Vision tunnel.
+	innerTLSClient := tls.Client(&netproxy.FakeNetConn{Conn: tunnelConn}, &tls.Config{
+		ServerName:         "127.0.0.1",
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS13,
+		MaxVersion:         tls.VersionTLS13,
+	})
+	defer innerTLSClient.Close()
+	if err := innerTLSClient.HandshakeContext(ctx); err != nil {
+		t.Fatalf("inner TLS 1.3 handshake over Vision failed: %v", err)
+	}
+
+	// Send multiple small and large application records to exercise the
+	// transition frame (HTTP/2 preface + request) and subsequent DirectCopy frames.
+	for i, size := range []int{24, 90, 512, 16 << 10, 64 << 10} {
+		msg := bytes.Repeat([]byte{byte(0x30 + i)}, size)
+		if _, err := innerTLSClient.Write(msg); err != nil {
+			t.Fatalf("inner TLS write %d (size=%d): %v", i, size, err)
+		}
+		reply := make([]byte, size)
+		if _, err := io.ReadFull(innerTLSClient, reply); err != nil {
+			t.Fatalf("inner TLS read %d (size=%d): %v", i, size, err)
+		}
+		if !bytes.Equal(reply, msg) {
+			t.Fatalf("inner TLS echo mismatch on chunk %d (size=%d)", i, size)
+		}
+	}
+
+	_, sawEnd := cfg.stats.snapshot()
+	if sawEnd != 1 {
+		t.Fatalf("server saw %d End/Direct transition frames, want 1", sawEnd)
+	}
+}
+
 // TestE2EVlessVisionUDPRelayOverTLS covers vision UDP: the client sends mux
 // packet frames addressed per datagram, the server relays through a real UDP
 // socket and pads every reply; integrity and source addressing are checked.

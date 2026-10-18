@@ -10,6 +10,7 @@ import (
 	"net"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -62,6 +63,7 @@ type Conn struct {
 	rawInput *bytes.Buffer
 
 	needHandshake              bool
+	handshakeTimer             *time.Timer
 	readRemainingContent       int
 	readRemainingPadding       int
 	readFilterUUID             bool
@@ -96,6 +98,13 @@ func (vc *Conn) Read(b []byte) (int, error) {
 		return vc.reader.Read(b)
 	}
 	return vc.read(b)
+}
+
+func (vc *Conn) Close() error {
+	if vc.handshakeTimer != nil {
+		vc.handshakeTimer.Stop()
+	}
+	return vc.Conn.Close()
 }
 
 func (vc *Conn) CloseWrite() error {
@@ -309,6 +318,19 @@ func (vc *Conn) Write(p []byte) (int, error) {
 	return vc.writer.Write(p)
 }
 
+// flushHandshakeIfNeeded sends an empty-content, long-padded Vision handshake
+// frame if the client has not written any payload within handshakeFlushDelay
+// (for server-speaks-first TCP protocols), mirroring vless.NewConn's 100ms
+// header flush without emitting an unpadded VLESS header on a Vision stream.
+func (vc *Conn) flushHandshakeIfNeeded() error {
+	vc.muWrite.Lock()
+	defer vc.muWrite.Unlock()
+	if !vc.needHandshake {
+		return nil
+	}
+	return vc.write(nil)
+}
+
 // // ReadFrom implements io.ReaderFrom.
 // func (vc *Conn) ReadFrom(r io.Reader) (n int64, err error) {
 // 	if !vc.writer.writeDirect {
@@ -340,21 +362,30 @@ func (vc *Conn) Write(p []byte) (int, error) {
 // 	return n, err
 // }
 
+// writePadding encodes one Vision frame ([UUID][command][contentLen][paddingLen][p][padding])
+// and writes it to w in a single Write call. Invariant: one Vision frame must
+// be emitted with one Write so the TLS transports below emit one TLS record per
+// frame instead of iout.MultiWrite splitting frames <= 4096 bytes into three
+// records.
+func writePadding(w io.Writer, p []byte, command byte, userUUID []byte, longPadding bool) error {
+	frame := ApplyPaddingFromPool(p, command, userUUID, longPadding)
+	defer frame.Put()
+	_, err := iout.WriteFull(w, frame)
+	return err
+}
+
 func (vc *Conn) write(p []byte) (err error) {
 	if vc.needHandshake {
-		var prefix, suffix pool.PB
 		vc.needHandshake = false
+		longPadding := false
 		if len(p) == 0 {
-			prefix, suffix = ApplyPaddingFromPool(p, commandPaddingContinue, vc.userUUID, false)
+			longPadding = true
 		} else {
 			vc.FilterTLS(p)
 			// logrus.Println("isTLS", vc.isTLS)
-			prefix, suffix = ApplyPaddingFromPool(p, commandPaddingContinue, vc.userUUID, vc.filterSnapshot().isTLS)
+			longPadding = vc.filterSnapshot().isTLS
 		}
-		defer prefix.Put()
-		defer suffix.Put()
-		_, err = iout.MultiWrite(vc.writer, prefix, p, suffix)
-		if err != nil {
+		if err = writePadding(vc.writer, p, commandPaddingContinue, vc.userUUID, longPadding); err != nil {
 			return err
 		}
 		if tlsConn, ok := vc.tlsConn.(*gotls.Conn); ok {
@@ -373,68 +404,73 @@ func (vc *Conn) write(p []byte) (err error) {
 	}
 
 	if vc.writeFilterApplicationData {
+		isCompleteAppData := isCompleteAppDataRecords(p)
 		p, p2 := ReshapeBytes(p)
 		vc.FilterTLS(p)
+		if p2 != nil {
+			vc.FilterTLS(p2)
+		}
 		// logrus.Println("isTLS2:", vc.isTLS, len(p), len(p2))
 		sn := vc.filterSnapshot()
-		command := commandPaddingContinue
 		if !sn.isTLS {
-			command = commandPaddingEnd
-
 			// disable XTLS
 			//vc.readProcess = false
 			vc.writeFilterApplicationData = false
 			vc.stopFilteringLocked()
-		} else if len(p) > 6 && bytes.Equal(p[:3], tlsApplicationDataStart) || sn.packetsToFilter <= 0 {
-			command = commandPaddingEnd
-			if sn.enableXTLS {
-				command = commandPaddingDirect
-				vc.toWriteDirect = true
-			}
-			vc.writeFilterApplicationData = false
-		}
-		// logrus.Println("command", commandPaddingDirect, "vc.writer.toWriteDirect", vc.writer.toWriteDirect)
-		prefix, suffix := ApplyPaddingFromPool(p, command, nil, sn.isTLS)
-		defer prefix.Put()
-		defer suffix.Put()
-		_, err = iout.MultiWrite(vc.writer, prefix, p, suffix)
-		if err != nil {
-			return err
-		}
-		// logrus.Println("command 2", commandPaddingDirect, "vc.writer.toWriteDirect", vc.writer.toWriteDirect)
-
-		if vc.toWriteDirect {
-			vc.writer.writeDirect = true
-			// logrus.Infoln("XTLS Vision direct write start")
-			// 	//time.Sleep(5 * time.Millisecond)
-		}
-		if p2 != nil {
-			if vc.toWriteDirect || !sn.isTLS {
-				_, err = vc.writer.Write(p2)
+			if err = writePadding(vc.writer, p, commandPaddingEnd, nil, false); err != nil {
 				return err
 			}
-			vc.FilterTLS(p)
-			// logrus.Println("isTLS3", vc.isTLS)
-			sn = vc.filterSnapshot()
-			command = commandPaddingContinue
-			if len(p) > 6 && bytes.Equal(p[:3], tlsApplicationDataStart) || sn.packetsToFilter <= 0 {
-				command = commandPaddingEnd
-				if sn.enableXTLS {
-					command = commandPaddingDirect
-					vc.toWriteDirect = true
-				}
+			if p2 != nil {
+				_, err = iout.WriteFull(vc.writer, p2)
+			}
+			return err
+		}
+
+		endCommand := commandPaddingEnd
+		if sn.enableXTLS {
+			endCommand = commandPaddingDirect
+		}
+		startsWithAppData := func(b []byte) bool {
+			return len(b) >= 6 && bytes.Equal(b[:3], tlsApplicationDataStart)
+		}
+		finishEarlyForLegacyTLS := !sn.isTLS12orAbove && sn.packetsToFilter <= 1
+
+		if p2 == nil {
+			switch {
+			case isCompleteAppData && startsWithAppData(p):
+				vc.toWriteDirect = sn.enableXTLS
 				vc.writeFilterApplicationData = false
+				err = writePadding(vc.writer, p, endCommand, nil, true)
+			case finishEarlyForLegacyTLS:
+				vc.writeFilterApplicationData = false
+				err = writePadding(vc.writer, p, commandPaddingEnd, nil, sn.isTLS)
+			default:
+				err = writePadding(vc.writer, p, commandPaddingContinue, nil, sn.isTLS)
 			}
-			// logrus.Println("command", commandPaddingDirect)
-			prefix2, suffix2 := ApplyPaddingFromPool(p2, command, nil, sn.isTLS)
-			defer prefix2.Put()
-			defer suffix2.Put()
-			_, err = iout.MultiWrite(vc.writer, prefix2, p2, suffix2)
-			if vc.toWriteDirect {
-				vc.writer.writeDirect = true
-				// logrus.Debugln("XTLS Vision direct write start")
-				// 	//time.Sleep(10 * time.Millisecond)
+		} else {
+			switch {
+			case isCompleteAppData && startsWithAppData(p):
+				vc.toWriteDirect = sn.enableXTLS
+				vc.writeFilterApplicationData = false
+				if err = writePadding(vc.writer, p, commandPaddingContinue, nil, true); err != nil {
+					return err
+				}
+				err = writePadding(vc.writer, p2, endCommand, nil, startsWithAppData(p2))
+			case finishEarlyForLegacyTLS:
+				vc.writeFilterApplicationData = false
+				if err = writePadding(vc.writer, p, commandPaddingEnd, nil, sn.isTLS); err != nil {
+					return err
+				}
+				_, err = iout.WriteFull(vc.writer, p2)
+			default:
+				if err = writePadding(vc.writer, p, commandPaddingContinue, nil, sn.isTLS); err != nil {
+					return err
+				}
+				err = writePadding(vc.writer, p2, commandPaddingContinue, nil, sn.isTLS)
 			}
+		}
+		if vc.toWriteDirect {
+			vc.writer.writeDirect = true
 		}
 		return err
 	}

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/daeuniverse/outbound/netproxy"
+	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/vless/vision"
 	outboundtls "github.com/daeuniverse/outbound/transport/tls"
 	utls "github.com/refraction-networking/utls"
@@ -59,5 +60,34 @@ func TestVisionNewConnAcceptsSkippedRealityUnderlay(t *testing.T) {
 	}
 	if conn == nil {
 		t.Fatal("expected vision conn on the skip path")
+	}
+}
+
+func TestNewDialerAcceptsVisionUDP443Flow(t *testing.T) {
+	rawDialer, err := NewDialer(nil, protocol.Header{
+		IsClient: true,
+		Password: "11111111-1111-1111-1111-111111111111",
+		Feature1: XRV + "-udp443",
+	})
+	if err != nil {
+		t.Fatalf("NewDialer(%q): %v", XRV+"-udp443", err)
+	}
+	d, ok := rawDialer.(*Dialer)
+	if !ok {
+		t.Fatalf("dialer type = %T, want *Dialer", rawDialer)
+	}
+	if d.flow != XRV {
+		t.Fatalf("d.flow = %q, want %q", d.flow, XRV)
+	}
+	if !d.xudp {
+		t.Fatal("expected d.xudp = true for xtls-rprx-vision-udp443")
+	}
+
+	if _, err := NewDialer(nil, protocol.Header{
+		IsClient: false,
+		Password: "11111111-1111-1111-1111-111111111111",
+		Feature1: XRV + "-udp443",
+	}); err == nil {
+		t.Fatal("expected server-mode xtls-rprx-vision-udp443 to be rejected")
 	}
 }
