@@ -22,9 +22,10 @@ func TestApplyPaddingFromPoolFillsPooledSuffix(t *testing.T) {
 	poisonPoolBucket(1100)
 
 	userUUID := make([]byte, 16)
-	prefix, suffix := ApplyPaddingFromPool([]byte("hi"), commandPaddingContinue, userUUID, true)
-	defer pool.Put(prefix)
-	defer pool.Put(suffix)
+	payload := []byte("hi")
+	frame := ApplyPaddingFromPool(payload, commandPaddingContinue, userUUID, true)
+	defer pool.Put(frame)
+	suffix := frame[PaddingHeaderLen+len(payload):]
 	if len(suffix) < 16 {
 		t.Fatalf("suffix too short to judge fill: %d", len(suffix))
 	}

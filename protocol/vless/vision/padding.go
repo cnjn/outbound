@@ -20,7 +20,11 @@ const (
 	BufferSize = 32 * 1024
 )
 
-func ApplyPaddingFromPool(p []byte, command byte, userUUID []byte, longPadding bool) (prefix, suffix pool.PB) {
+// ApplyPaddingFromPool builds a complete Vision frame
+// ([userUUID][command][contentLen(2B)][paddingLen(2B)][p][random padding])
+// in a single pooled buffer so writePadding can emit the entire frame in one
+// Write call (and therefore one outer TLS record).
+func ApplyPaddingFromPool(p []byte, command byte, userUUID []byte, longPadding bool) (frame pool.PB) {
 	contentLen := int32(len(p))
 	var paddingLen int32
 	if contentLen < 900 && longPadding {
@@ -30,23 +34,24 @@ func ApplyPaddingFromPool(p []byte, command byte, userUUID []byte, longPadding b
 		paddingLen = fastrand.Int31n(256)
 	}
 
-	prefix = pool.Get(len(userUUID) + 1 + 2 + 2)
-	suffix = pool.Get(int(paddingLen))
-	if paddingLen > 0 {
-		_, _ = fastrand.Read(suffix)
-	}
+	headerLen := len(userUUID) + 1 + 2 + 2
+	frame = pool.Get(headerLen + len(p) + int(paddingLen))
 	start := 0
 	if userUUID != nil {
-		copy(prefix, userUUID[:])
-		start += len(userUUID)
+		start += copy(frame, userUUID)
 	}
-	prefix[start] = command
+	frame[start] = command
 	start++
-	binary.BigEndian.PutUint16(prefix[start:], uint16(contentLen))
+	binary.BigEndian.PutUint16(frame[start:], uint16(contentLen))
 	start += 2
-	binary.BigEndian.PutUint16(prefix[start:], uint16(paddingLen))
+	binary.BigEndian.PutUint16(frame[start:], uint16(paddingLen))
+	start += 2
+	start += copy(frame[start:], p)
+	if paddingLen > 0 {
+		_, _ = fastrand.Read(frame[start:])
+	}
 	// logrus.Debugln("XTLS Vision write padding2: command=%d, payloadLen=%d, paddingLen=%d", command, contentLen, paddingLen)
-	return prefix, suffix
+	return frame
 }
 
 func ReshapeBytes(b []byte) (_ []byte, b2 []byte) {

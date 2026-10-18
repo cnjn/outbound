@@ -1109,12 +1109,9 @@ func serveVisionDirectTCPRelay(t *testing.T, cfg *serverConfig, tc *tls.Conn, ra
 // TestE2EVlessVisionInnerTLS13DirectCopy runs a real inner TLS 1.3 handshake
 // and data transfer inside an outer TLS 1.3 VLESS+Vision tunnel, verifying
 // that:
-//  1. Each Vision padding frame is emitted in a single outer TLS record so the
-//     server's outer TLS reader never swallows trailing DirectCopy records into
-//     rawInput while reading padding;
-//  2. Inner TLS 1.3 ChangeCipherSpec + Finished stays on commandPaddingContinue
+//  1. Inner TLS 1.3 ChangeCipherSpec + Finished stays on commandPaddingContinue
 //     and does not prematurely trigger DirectCopy;
-//  3. The first inner TLS 1.3 ApplicationData record triggers commandPaddingDirect
+//  2. The first inner TLS 1.3 ApplicationData record triggers commandPaddingDirect
 //     and cleanly transitions both directions to raw underlay DirectCopy.
 func TestE2EVlessVisionInnerTLS13DirectCopy(t *testing.T) {
 	// Start an inner TLS 1.3 echo target (simulating an HTTPS origin on :443).
