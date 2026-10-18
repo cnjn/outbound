@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -128,7 +129,7 @@ func BenchmarkIsDNSTimeout_StringMatch(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		// Old approach: string matching
 		errStr := err.Error()
-		_ = contains(errStr, "i/o timeout") && contains(errStr, "lookup")
+		_ = strings.Contains(errStr, "i/o timeout") && strings.Contains(errStr, "lookup")
 	}
 }
 
@@ -157,7 +158,7 @@ func BenchmarkIsStreamExhausted_StringMatch(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		// Old approach: string matching
-		_ = contains(err.Error(), "too many open streams")
+		_ = strings.Contains(err.Error(), "too many open streams")
 	}
 }
 

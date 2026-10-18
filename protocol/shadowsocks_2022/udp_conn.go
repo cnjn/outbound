@@ -1,8 +1,6 @@
 package shadowsocks_2022
 
 import (
-	"bytes"
-	"context"
 	"crypto/cipher"
 	"encoding/binary"
 	"fmt"
@@ -34,8 +32,6 @@ type UdpConn struct {
 
 	sessionID [8]byte
 	packetID  atomic.Uint64
-	ctx       context.Context
-	ctxMu     sync.RWMutex
 
 	// cipher is derived from the local session ID and reused for outbound
 	// packets. Inbound packets must decrypt against the remote session ID
@@ -78,19 +74,12 @@ type udpSessionReplayState struct {
 }
 
 // NewUdpConn creates a new UDP connection bound to a shared SS2022 profile.
+// The connection is not bound to the dial context: UDP sessions are
+// long-lived and must not be torn down by the dial's timeout or cancellation.
 func NewUdpConn(conn net.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
-	return NewUdpConnWithContext(context.Background(), conn, core, bloom)
-}
-
-// NewUdpConnWithContext creates a new UDP connection with the given context.
-// For UDP, the context is only used to check for cancellation during the initial setup,
-// not for ongoing I/O operations. UDP connections are long-lived and should not be
-// bound to the dial context's timeout.
-func NewUdpConnWithContext(ctx context.Context, conn net.Conn, core *SS2022Core, bloom *disk_bloom.FilterGroup) (*UdpConn, error) {
 	u := &UdpConn{
 		SS2022Core:     core,
 		Conn:           conn,
-		ctx:            context.Background(), // Use Background for long-lived UDP connections
 		bloom:          bloom,
 		decryptCiphers: make(map[[8]byte]cipher.AEAD, 16),
 	}
@@ -98,62 +87,6 @@ func NewUdpConnWithContext(ctx context.Context, conn net.Conn, core *SS2022Core,
 	// Generate session ID
 	_, _ = fastrand.Read(u.sessionID[:])
 	return u, nil
-}
-
-// getContext returns the current context, defaulting to background if not set.
-func (c *UdpConn) getContext() context.Context {
-	c.ctxMu.RLock()
-	defer c.ctxMu.RUnlock()
-	if c.ctx != nil {
-		return c.ctx
-	}
-	return context.Background()
-}
-
-// checkContextAndSetReadDeadline checks if the context is cancelled before a blocking read.
-// Returns true if the operation should proceed, false if it should be aborted.
-// For UDP, we respect the context's deadline if set, but don't impose arbitrary short timeouts
-// that could break legitimate long-lived connections over high-latency networks.
-func (c *UdpConn) checkContextAndSetReadDeadline() bool {
-	ctx := c.getContext()
-	select {
-	case <-ctx.Done():
-		return false
-	default:
-	}
-	// Only set a deadline if the context has one.
-	// This preserves the original behavior (no timeout) while still supporting
-	// context cancellation for graceful shutdown.
-	if deadline, ok := ctx.Deadline(); ok {
-		// Use the context's deadline, not a fixed 5-second timeout
-		if dl, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
-			_ = dl.SetReadDeadline(deadline)
-		}
-	}
-	return true
-}
-
-// checkContextAndSetWriteDeadline checks if the context is cancelled before a blocking write.
-// Returns true if the operation should proceed, false if it should be aborted.
-// For UDP, we respect the context's deadline if set, but don't impose arbitrary short timeouts
-// that could break legitimate long-lived connections over high-latency networks.
-func (c *UdpConn) checkContextAndSetWriteDeadline() bool {
-	ctx := c.getContext()
-	select {
-	case <-ctx.Done():
-		return false
-	default:
-	}
-	// Only set a deadline if the context has one.
-	// This preserves the original behavior (no timeout) while still supporting
-	// context cancellation for graceful shutdown.
-	if deadline, ok := ctx.Deadline(); ok {
-		// Use the context's deadline, not a fixed 5-second timeout
-		if dl, ok := c.Conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
-			_ = dl.SetWriteDeadline(deadline)
-		}
-	}
-	return true
 }
 
 func (c *UdpConn) ensureCipher() error {
@@ -336,9 +269,6 @@ func (c *UdpConn) WriteTo(b []byte, addr string) (int, error) {
 	}
 	defer pool.Put(packet)
 
-	if !c.checkContextAndSetWriteDeadline() {
-		return 0, io.EOF
-	}
 	n, err := c.Write(packet)
 	if err != nil {
 		return 0, err
@@ -407,12 +337,11 @@ func (c *UdpConn) sealChachaPacket(b []byte, addrInfo *socks5.AddressInfo, packe
 		return nil, oops.Wrapf(err, "fail to calculate address length")
 	}
 
-	// For Chacha, EIH is placed before the message content
-	// Format: nonce + EIH + (session_id + packet_id + header + timestamp + padding_len + addr + payload)
-	// The EIH is encrypted together with the message as associated data is not used here
-	eihLen := c.IdentityHeaderLen()
+	// Packet structure: nonce + message. EIH never applies here: multi-PSK is
+	// only constructed with an AES cipher, which WriteTo routes to the block
+	// path, so this chacha path is always single-PSK.
 	messageLen := 16 + 1 + 8 + 2 + addrLen + len(b)
-	totalPacketLen := udpPacketNonceSize + eihLen + messageLen + c.CipherConf().TagLen
+	totalPacketLen := udpPacketNonceSize + messageLen + c.CipherConf().TagLen
 	packet := pool.Get(totalPacketLen)
 	defer func() {
 		if err != nil {
@@ -423,10 +352,7 @@ func (c *UdpConn) sealChachaPacket(b []byte, addrInfo *socks5.AddressInfo, packe
 	nonce := packet[:udpPacketNonceSize]
 	_, _ = fastrand.Read(nonce)
 
-	// Build packet structure: nonce + EIH + message
-	eihOffset := udpPacketNonceSize
-	messageOffset := eihOffset + eihLen
-	message := packet[messageOffset : messageOffset+messageLen]
+	message := packet[udpPacketNonceSize : udpPacketNonceSize+messageLen]
 	copy(message[:8], c.sessionID[:])
 	binary.BigEndian.PutUint64(message[8:16], packetID)
 	message[16] = HeaderTypeClientStream
@@ -439,21 +365,8 @@ func (c *UdpConn) sealChachaPacket(b []byte, addrInfo *socks5.AddressInfo, packe
 	}
 	copy(message[27+addrWritten:], b)
 
-	// Write EIH if multi-PSK is enabled
-	if eihLen > 0 {
-		// Build separate header for EIH derivation (session_id + packet_id)
-		var separateHeader [16]byte
-		copy(separateHeader[:8], c.sessionID[:])
-		binary.BigEndian.PutUint64(separateHeader[8:], packetID)
-
-		_, err = c.WriteIdentityHeader(packet[eihOffset:], separateHeader[:])
-		if err != nil {
-			return nil, oops.Wrapf(err, "fail to write identity header")
-		}
-	}
-
-	// Seal the entire message (EIH is included as part of plaintext)
-	return c.cipher.Seal(packet[:udpPacketNonceSize], nonce, packet[eihOffset:messageOffset+messageLen], nil), nil
+	// Seal the entire message
+	return c.cipher.Seal(packet[:udpPacketNonceSize], nonce, message, nil), nil
 }
 
 // WriteBatch implements netproxy.PacketBatchWriter: seal every datagram
@@ -495,12 +408,6 @@ func (c *UdpConn) WriteBatch(items []netproxy.BatchItem) (int, error) {
 			return 0, err
 		}
 		packets[i] = packet
-	}
-	if !c.checkContextAndSetWriteDeadline() {
-		for _, packet := range packets {
-			pool.Put(packet)
-		}
-		return 0, io.EOF
 	}
 	if bw, ok := c.Conn.(netproxy.PacketBatchWriter); ok {
 		defer func() {
@@ -568,11 +475,6 @@ func (c *UdpConn) mapReceivedPacket(packet *netproxy.ReceivedPacket) (*netproxy.
 	if packet.Err != nil {
 		return packet, true
 	}
-	if !c.checkContextAndSetReadDeadline() {
-		packet.Err = io.EOF
-		packet.Data = nil
-		return packet, true
-	}
 	var payload []byte
 	var addr netip.AddrPort
 	var err error
@@ -598,17 +500,9 @@ func (c *UdpConn) ReadFrom(b []byte) (n int, addr netip.AddrPort, err error) {
 
 	buf := pool.Get(len(b) + 16 + c.CipherConf().TagLen)
 	defer pool.Put(buf)
-	if !c.checkContextAndSetReadDeadline() {
-		return 0, netip.AddrPort{}, io.EOF
-	}
 	n, err = c.Read(buf)
 	if err != nil {
 		return 0, netip.AddrPort{}, err
-	}
-	select {
-	case <-c.getContext().Done():
-		return 0, netip.AddrPort{}, c.getContext().Err()
-	default:
 	}
 	payload, addr, err := c.decodeBlockPacket(buf[:n], time.Now())
 	if err != nil {
@@ -645,7 +539,7 @@ func (c *UdpConn) decodeBlockPacket(buf []byte, now time.Time) ([]byte, netip.Ad
 	// committing anti-replay state" line as the Open above and as the chacha
 	// path. Committing on a packet that then fails validation would burn the
 	// packet ID of a packet that was never delivered.
-	out, addr, err := c.decodePacketPayload(buf, payload, now)
+	out, addr, err := c.decodePacketPayload(payload, now)
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
@@ -662,21 +556,21 @@ func (c *UdpConn) readFromChacha(b []byte) (n int, addr netip.AddrPort, err erro
 
 	buf := pool.Get(len(b) + udpPacketNonceSize + c.CipherConf().TagLen + 320)
 	defer pool.Put(buf)
-	if !c.checkContextAndSetReadDeadline() {
-		return 0, netip.AddrPort{}, io.EOF
-	}
 	n, err = c.Read(buf)
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	select {
-	case <-c.getContext().Done():
-		return 0, netip.AddrPort{}, c.getContext().Err()
-	default:
-	}
 	payload, addr, err := c.decodeChachaPacket(buf[:n], time.Now())
 	if err != nil {
 		return 0, netip.AddrPort{}, err
+	}
+	if len(payload) > len(b) {
+		// The decrypted datagram does not fit the caller's buffer. The read
+		// buffer's slack (+320) lets the wire datagram arrive and
+		// authenticate fully, so the oversize is known exactly here:
+		// surface it as a dropped datagram per the typed read contract
+		// instead of silently truncating a successful return.
+		return 0, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
 	}
 	return copy(b, payload), addr, nil
 }
@@ -695,26 +589,17 @@ func (c *UdpConn) decodeChachaPacket(buf []byte, now time.Time) ([]byte, netip.A
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
-	reader := bytes.NewReader(payload)
-	eihLen := c.IdentityHeaderLen()
-	if eihLen > 0 {
-		if _, err := reader.Seek(int64(eihLen), io.SeekCurrent); err != nil {
-			return nil, netip.AddrPort{}, fmt.Errorf("failed to skip EIH: %w", err)
-		}
-	}
+	// No EIH skip here: multi-PSK is only constructed with an AES cipher,
+	// which WriteTo routes to the block path, so this chacha path always
+	// carries a single-PSK datagram.
 	var sessionID [8]byte
-	if _, err := io.ReadFull(reader, sessionID[:]); err != nil {
-		return nil, netip.AddrPort{}, fmt.Errorf("failed to read session ID: %w", err)
-	}
-	var packetID uint64
-	if err := binary.Read(reader, binary.BigEndian, &packetID); err != nil {
-		return nil, netip.AddrPort{}, fmt.Errorf("failed to read packet ID: %w", err)
-	}
+	copy(sessionID[:], payload[:8])
+	packetID := binary.BigEndian.Uint64(payload[8:16])
 	// Validate the whole payload (header type + timestamp) before committing
 	// the replay window: a packet that decrypts but is malformed or stale must
 	// not burn its ID in the window, and a forged-but-decryptable packet must
 	// not advance it.
-	out, addr, err := c.decodePacketPayload(buf, payload[reader.Size()-int64(reader.Len()):], now)
+	out, addr, err := c.decodePacketPayload(payload[16:], now)
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
@@ -724,26 +609,23 @@ func (c *UdpConn) decodeChachaPacket(buf []byte, now time.Time) ([]byte, netip.A
 	return out, addr, nil
 }
 
-func (c *UdpConn) decodePacketPayload(buf, payload []byte, now time.Time) ([]byte, netip.AddrPort, error) {
-	reader := bytes.NewReader(payload)
-	var typ uint8
-	if err := binary.Read(reader, binary.BigEndian, &typ); err != nil {
-		return nil, netip.AddrPort{}, fmt.Errorf("failed to read header type: %w", err)
+// decodePacketPayload validates the decrypted server datagram header and
+// splits off the reply body. It parses by offset directly instead of through
+// a bytes.Reader: this is the UDP receive hot path, and the shadowsocks
+// legacy decoder (splitDecryptedUdp) already established the zero-alloc
+// slicing pattern.
+func (c *UdpConn) decodePacketPayload(payload []byte, now time.Time) ([]byte, netip.AddrPort, error) {
+	// Fixed header: type(1) + timestamp(8) + session ID(8) + padding length(2).
+	const fixedHeaderLen = 19
+	if len(payload) < fixedHeaderLen {
+		return nil, netip.AddrPort{}, fmt.Errorf("failed to read fixed header: %w", io.ErrUnexpectedEOF)
 	}
-	var timestampRaw uint64
-	if err := binary.Read(reader, binary.BigEndian, &timestampRaw); err != nil {
-		return nil, netip.AddrPort{}, fmt.Errorf("failed to read timestamp: %w", err)
-	}
-	timestamp := time.Unix(int64(timestampRaw), 0)
-	if _, err := reader.Seek(8, io.SeekCurrent); err != nil {
-		return nil, netip.AddrPort{}, fmt.Errorf("failed to skip session ID: %w", err)
-	}
-	var paddingLength uint16
-	if err := binary.Read(reader, binary.BigEndian, &paddingLength); err != nil {
-		return nil, netip.AddrPort{}, fmt.Errorf("failed to read padding length: %w", err)
-	}
-	if _, err := reader.Seek(int64(paddingLength), io.SeekCurrent); err != nil {
-		return nil, netip.AddrPort{}, fmt.Errorf("failed to skip padding: %w", err)
+	typ := payload[0]
+	timestamp := time.Unix(int64(binary.BigEndian.Uint64(payload[1:9])), 0)
+	paddingLength := binary.BigEndian.Uint16(payload[17:19])
+	offset := fixedHeaderLen + int(paddingLength)
+	if offset > len(payload) {
+		return nil, netip.AddrPort{}, fmt.Errorf("failed to skip padding: %w", io.ErrUnexpectedEOF)
 	}
 	if typ != HeaderTypeServerStream {
 		return nil, netip.AddrPort{}, fmt.Errorf("received unexpected header type: %d", typ)
@@ -751,16 +633,38 @@ func (c *UdpConn) decodePacketPayload(buf, payload []byte, now time.Time) ([]byt
 	if err := validateTimestamp(timestamp, now); err != nil {
 		return nil, netip.AddrPort{}, err
 	}
-	netAddr, err := socks5.ReadAddr(reader)
+	addr, addrLen, err := parseAddrPort(payload[offset:])
 	if err != nil {
 		return nil, netip.AddrPort{}, err
 	}
-	var addr netip.AddrPort
-	if udpAddr, ok := netAddr.(*net.UDPAddr); ok {
-		ipAddr, _ := netip.AddrFromSlice(udpAddr.IP)
-		addr = netip.AddrPortFrom(ipAddr, uint16(udpAddr.Port))
+	// A server datagram whose header and address consumed the whole payload
+	// is legitimate: the address itself is the message (e.g. some
+	// DNS/IP-ECHO style services reply with an empty body), so an empty
+	// result is returned as-is rather than as an error.
+	return payload[offset+addrLen:], addr, nil
+}
+
+// parseAddrPort reads the SOCKS-style address prefix of a decrypted server
+// datagram and reports how many bytes it consumed. Server replies carry an
+// IP address; a domain or other type is a protocol violation on this path.
+func parseAddrPort(b []byte) (addr netip.AddrPort, n int, err error) {
+	if len(b) < 1 {
+		return netip.AddrPort{}, 0, fmt.Errorf("%w: too short", socks5.ErrInvalidAddress)
 	}
-	out := buf[:reader.Len()]
-	n, err := reader.Read(out)
-	return out[:n], addr, err
+	switch socks5.AddressType(b[0]) {
+	case socks5.AddressTypeIPv4:
+		if len(b) < 1+4+2 {
+			return netip.AddrPort{}, 0, fmt.Errorf("%w: too short", socks5.ErrInvalidAddress)
+		}
+		addr = netip.AddrPortFrom(netip.AddrFrom4([4]byte(b[1:5])), binary.BigEndian.Uint16(b[5:7]))
+		return addr, 7, nil
+	case socks5.AddressTypeIPv6:
+		if len(b) < 1+16+2 {
+			return netip.AddrPort{}, 0, fmt.Errorf("%w: too short", socks5.ErrInvalidAddress)
+		}
+		addr = netip.AddrPortFrom(netip.AddrFrom16([16]byte(b[1:17])), binary.BigEndian.Uint16(b[17:19]))
+		return addr, 19, nil
+	default:
+		return netip.AddrPort{}, 0, fmt.Errorf("unsupported address type for UDP: %v", socks5.AddressType(b[0]))
+	}
 }

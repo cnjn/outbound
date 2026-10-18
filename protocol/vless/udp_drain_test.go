@@ -3,10 +3,12 @@ package vless
 import (
 	"bytes"
 	"encoding/binary"
+	stderrors "errors"
 	"io"
 	"net/netip"
 	"testing"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol"
 	"github.com/daeuniverse/outbound/protocol/vmess"
 )
@@ -32,8 +34,12 @@ func TestUDPReadFromDrainsOversizedDatagram(t *testing.T) {
 	}
 	small := make([]byte, 4)
 	n, _, err := c.ReadFrom(small)
-	if err == nil {
-		t.Fatal("expected buffer-too-small error")
+	// The drained oversized datagram must surface as the typed
+	// datagram-dropped contract (unwrapping to io.ErrShortBuffer), never as
+	// an untyped error or a session-fatal condition.
+	var dropped *netproxy.ErrDatagramDropped
+	if !stderrors.As(err, &dropped) || !stderrors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("ReadFrom err = %v, want datagram-dropped/ErrShortBuffer", err)
 	}
 	if n != 0 {
 		t.Fatalf("n = %d, want 0", n)
@@ -67,8 +73,9 @@ func TestUDPReadDrainsOversizedDatagram(t *testing.T) {
 		readHeaderDone: true,
 	}
 	_, err := c.Read(make([]byte, 4))
-	if err == nil {
-		t.Fatal("expected buffer-too-small error")
+	var dropped *netproxy.ErrDatagramDropped
+	if !stderrors.As(err, &dropped) || !stderrors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("Read err = %v, want datagram-dropped/ErrShortBuffer", err)
 	}
 	rest := make([]byte, 4)
 	if _, err := io.ReadFull(c.Conn, rest); err != nil {

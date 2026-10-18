@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/daeuniverse/outbound/pkg/coalesce"
+	"net"
 	"net/url"
 	"strconv"
 	"strings"
@@ -135,18 +135,26 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 			Handshake() error
 		}
 
-		// Coalesce the TLS records of one write burst into one socket
-		// write. Both crypto/tls and utls issue one underlying Write per
-		// record; on bulk relay paths that is ~3 write syscalls per 32KB.
-		co := coalesce.New(&netproxy.FakeNetConn{
+		// No write shaping here, by contract: crypto/tls and utls issue one
+		// underlying Write per TLS record, and that per-record granularity is
+		// the camouflage this transport owes its users. Coalescing the
+		// records of a burst into one socket write changes the wire pattern
+		// into a shape no browser produces, and pattern-classifying filters
+		// (observed in production, 2026-10: whole flows blackholed while
+		// small flows passed) punish exactly that. Throughput-class
+		// protocols that own their wire pattern (anytls) apply coalescing
+		// themselves around their TLS conn; see pkg/coalesce. The
+		// wire_shape_test pins the invariant: no underlying write may exceed
+		// one TLS record.
+		raw := &netproxy.FakeNetConn{
 			Conn:  rc,
 			LAddr: nil,
 			RAddr: nil,
-		})
+		}
 
 		switch s.tlsImplentation {
 		case "tls":
-			tlsConn = tls.Client(co, s.tlsConfig)
+			tlsConn = tls.Client(raw, s.tlsConfig)
 
 		case "utls":
 			clientHelloID, err := nameToUtlsClientHelloID(s.utlsImitate)
@@ -156,7 +164,7 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 				return nil, err
 			}
 
-			tlsConn = utls.UClient(co, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID)
+			tlsConn = utls.UClient(raw, uTLSConfigFromTLSConfig(s.tlsConfig), *clientHelloID)
 
 		default:
 			_ = rc.Close()
@@ -167,16 +175,22 @@ func (s *Tls) DialContext(ctx context.Context, network, addr string) (c netproxy
 			_ = tlsConn.Close()
 			return nil, err
 		}
-		// The handshake writes through the coalescer; a read that blocks on
-		// the peer flushes it, but push it out now so the first application
-		// write ordering is deterministic.
-		if err := co.Flush(); err != nil {
-			_ = tlsConn.Close()
-			return nil, err
-		}
-		// Flush after every protocol Write so unmanaged Write/Read users
-		// never observe stalled records.
-		return coalesce.NewFlushConn(tlsConn, co), nil
+		// The forwarder keeps the raw socket reachable for UnwrapTCPConn:
+		// TLS conns are opaque to unwrapping, and copy loops above need the
+		// kernel receive-queue state to decide whether another read
+		// completes immediately (write batching).
+		return netproxy.NewUnderlyingConnForwarder(
+			tlsConn, func() net.Conn {
+				// rc is a netproxy.Conn; peel it through the same
+				// FakeNetConn adapter used for the TLS conn above.
+				if u, ok := rc.(interface{ UnderlyingConn() net.Conn }); ok {
+					return u.UnderlyingConn()
+				}
+				if nc, ok := rc.(net.Conn); ok {
+					return nc
+				}
+				return nil
+			}), nil
 	case "udp":
 		if s.passthroughUdp {
 			return s.dialer.DialContext(ctx, network, addr)

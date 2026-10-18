@@ -25,12 +25,20 @@ type directPacketConn struct {
 	receiverStop       func()
 	receiverGeneration uint64
 	cachedDialTgt      atomic.Value // stores netip.AddrPort
-	writeTgtCache      common.LastStringValue[netip.AddrPort]
-	cacheMu            sync.Mutex // serializes lazy dial-target resolution in resolveTarget
-	resolver           *net.Resolver
-	batchOnce          sync.Once
-	batchWriter        packetBatchWriter
+	// writeTgtCache remembers resolved non-dial targets so a FullCone socket
+	// relaying to several peers does not re-resolve on every datagram. It is
+	// bounded: a pathological many-peer relay must not grow it without limit,
+	// and eviction only costs one re-resolve.
+	writeTgtCache map[string]netip.AddrPort
+	cacheMu       sync.Mutex // guards the bounded target cache; never held across a resolve
+	resolver      *net.Resolver
+	batchOnce     sync.Once
+	batchWriter   packetBatchWriter
 }
+
+// writeTgtCacheCapacity bounds the resolved-target cache on one FullCone
+// socket; realistic relays stay well below it.
+const writeTgtCacheCapacity = 8
 
 // Close unregisters the socket from the shared packet receiver before closing
 // its underlying UDP descriptor.
@@ -193,8 +201,14 @@ func (c *directPacketConn) resolveTarget() error {
 	// Retryable by design: a failure must not be memoized for the lifetime
 	// of the conn (fullcone UDP relays live for hours — a transient resolver
 	// outage at first write would otherwise fail every later write).
-	c.cacheMu.Lock()
-	defer c.cacheMu.Unlock()
+	//
+	// The check and the publication below are two phases around the
+	// resolution, which can block for the resolver timeout: holding cacheMu
+	// across it stalled every lookup of the bounded target cache — and
+	// therefore every write to any other peer — for as long as one lookup
+	// took. Two writers that miss the same brand-new target may now resolve
+	// it concurrently; they publish the same address, so the duplicate only
+	// costs one lookup.
 	if c.cachedDialTgt.Load() != nil {
 		return nil
 	}
@@ -219,7 +233,10 @@ func (c *directPacketConn) writeTargetAddrPort(addr string) (netip.AddrPort, err
 		}
 		return c.cachedDialTgt.Load().(netip.AddrPort), nil
 	}
-	if cached, ok := c.writeTgtCache.Load(addr); ok {
+	c.cacheMu.Lock()
+	cached, ok := c.writeTgtCache[addr]
+	c.cacheMu.Unlock()
+	if ok {
 		return cached, nil
 	}
 	uAddr, err := resolveUDPAddr(c.resolver, addr)
@@ -228,8 +245,25 @@ func (c *directPacketConn) writeTargetAddrPort(addr string) (netip.AddrPort, err
 	}
 	resolved := uAddr.AddrPort()
 	target := netip.AddrPortFrom(resolved.Addr().Unmap(), resolved.Port())
-	c.writeTgtCache.Store(addr, target)
+	c.cacheMu.Lock()
+	c.storeWriteTgtLocked(addr, target)
+	c.cacheMu.Unlock()
 	return target, nil
+}
+
+// storeWriteTgtLocked inserts into the bounded target cache, evicting an
+// arbitrary entry when full (map iteration order); the caller holds cacheMu.
+func (c *directPacketConn) storeWriteTgtLocked(addr string, target netip.AddrPort) {
+	if c.writeTgtCache == nil {
+		c.writeTgtCache = make(map[string]netip.AddrPort, writeTgtCacheCapacity)
+	}
+	if len(c.writeTgtCache) >= writeTgtCacheCapacity {
+		for victim := range c.writeTgtCache {
+			delete(c.writeTgtCache, victim)
+			break
+		}
+	}
+	c.writeTgtCache[addr] = target
 }
 
 func (c *directPacketConn) Write(b []byte) (int, error) {
@@ -237,22 +271,14 @@ func (c *directPacketConn) Write(b []byte) (int, error) {
 		return c.UDPConn.Write(b)
 	}
 
-	// Lazy target resolution with thread-safe initialization.
-	// Thread-safety guarantees:
-	// 1. cacheMu in resolveTarget() provides happens-before relationship
-	// 2. atomic.Value.Load/Store provides atomic access to the cached value
-	// 3. The netip.AddrPort value is stored directly in atomic.Value (heap-allocated)
-	if c.cachedDialTgt.Load() == nil {
-		if err := c.resolveTarget(); err != nil {
-			return 0, err
-		}
+	target, err := c.writeTargetAddrPort(c.dialTgt)
+	if err != nil {
+		return 0, err
 	}
-
 	// No lock needed: Go's net.UDPConn.WriteToUDPAddrPort() is thread-safe.
 	// From Go's net package documentation:
 	// "Multiple goroutines may invoke methods on a PacketConn simultaneously."
-	cached := c.cachedDialTgt.Load().(netip.AddrPort)
-	return c.WriteToUDPAddrPort(b, cached)
+	return c.WriteToUDPAddrPort(b, target)
 }
 
 func (c *directPacketConn) Read(b []byte) (int, error) {

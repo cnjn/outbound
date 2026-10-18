@@ -25,7 +25,7 @@ func (c *Conn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 		if _, discardErr := io.CopyN(io.Discard, &netproxy.ReadWrapper{ReadFunc: c.read}, int64(length)); discardErr != nil {
 			return 0, netip.AddrPort{}, discardErr
 		}
-		return 0, netip.AddrPort{}, io.ErrShortBuffer
+		return 0, netip.AddrPort{}, netproxy.DatagramDropped(io.ErrShortBuffer)
 	}
 	n, err = io.ReadFull(&netproxy.ReadWrapper{ReadFunc: c.read}, p[:length])
 	return n, addr, err

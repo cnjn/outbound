@@ -137,14 +137,6 @@ func ReadAuthenticateWithHead(head *CommandHead, reader BufferedReader) (c *Auth
 	return &_c, nil
 }
 
-func ReadAuthenticate(reader BufferedReader) (c *Authenticate, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadAuthenticateWithHead(head, reader)
-}
-
 func GenToken(state quic.ConnectionState, uuid [16]byte, password string) (token [32]byte, err error) {
 	var tokenBytes []byte
 	tokenBytes, err = state.TLS.ExportKeyingMaterial(string(uuid[:]), []byte(password), 32)
@@ -199,14 +191,6 @@ func ReadConnectWithHead(head *CommandHead, reader BufferedReader) (c *Connect, 
 		return nil, err
 	}
 	return &_c, nil
-}
-
-func ReadConnect(reader BufferedReader) (c *Connect, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadConnectWithHead(head, reader)
 }
 
 func (c Connect) WriteTo(writer BufferedWriter) (err error) {
@@ -314,14 +298,6 @@ func ReadPacketWithHead(head *CommandHead, reader BufferedReader) (c *Packet, er
 	return &_c, nil
 }
 
-func ReadPacket(reader BufferedReader) (c *Packet, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadPacketWithHead(head, reader)
-}
-
 func (c Packet) WriteTo(writer BufferedWriter) (err error) {
 	// Serialize straight into the writer's tail when it supports Extend
 	// (pool/bytes.Buffer), skipping the intermediate heap buffer and extra
@@ -369,8 +345,6 @@ func (c Packet) BytesLen() int {
 	return c.CommandHead.BytesLen() + 8 + c.ADDR.BytesLen() + len(c.DATA)
 }
 
-var PacketOverHead = NewPacket(0, 0, 0, 0, 0, NewAddressAddrPort(netip.AddrPortFrom(netip.IPv6Unspecified(), 0)), nil, 0).BytesLen()
-
 type Dissociate struct {
 	*CommandHead
 	ASSOC_ID uint16
@@ -381,28 +355,6 @@ func NewDissociate(ASSOC_ID uint16, VER byte) *Dissociate {
 		CommandHead: NewCommandHead(DissociateType, VER),
 		ASSOC_ID:    ASSOC_ID,
 	}
-}
-
-func ReadDissociateWithHead(head *CommandHead, reader BufferedReader) (c *Dissociate, err error) {
-	var _c Dissociate
-	_c.CommandHead = head
-	if _c.TYPE != DissociateType {
-		err = fmt.Errorf("error command type: %s", _c.TYPE)
-		return nil, err
-	}
-	err = binary.Read(reader, binary.BigEndian, &_c.ASSOC_ID)
-	if err != nil {
-		return nil, err
-	}
-	return &_c, nil
-}
-
-func ReadDissociate(reader BufferedReader) (c *Dissociate, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadDissociateWithHead(head, reader)
 }
 
 func (c Dissociate) WriteTo(writer BufferedWriter) (err error) {
@@ -419,34 +371,6 @@ func (c Dissociate) WriteTo(writer BufferedWriter) (err error) {
 
 func (c Dissociate) BytesLen() int {
 	return c.CommandHead.BytesLen() + 4
-}
-
-type Heartbeat struct {
-	*CommandHead
-}
-
-func NewHeartbeat(VER byte) *Heartbeat {
-	return &Heartbeat{
-		CommandHead: NewCommandHead(HeartbeatType, VER),
-	}
-}
-
-func ReadHeartbeatWithHead(head *CommandHead, reader BufferedReader) (c *Heartbeat, err error) {
-	var _c Heartbeat
-	_c.CommandHead = head
-	if _c.TYPE != HeartbeatType {
-		err = fmt.Errorf("error command type: %s", _c.TYPE)
-		return nil, err
-	}
-	return &_c, nil
-}
-
-func ReadHeartbeat(reader BufferedReader) (c *Heartbeat, err error) {
-	head, err := ReadCommandHead(reader)
-	if err != nil {
-		return
-	}
-	return ReadHeartbeatWithHead(head, reader)
 }
 
 // Addr types
@@ -495,23 +419,6 @@ func NewAddress(metadata *protocol.Metadata) *Address {
 		ADDR: addr,
 		PORT: metadata.Port,
 	}
-}
-
-func NewAddressNetAddr(addr net.Addr) (*Address, error) {
-	if addr, ok := addr.(interface{ AddrPort() netip.AddrPort }); ok {
-		if addrPort := addr.AddrPort(); addrPort.IsValid() { // sing's M.Socksaddr maybe return an invalid AddrPort if it's a DomainName
-			return NewAddressAddrPort(addrPort), nil
-		}
-	}
-	addrStr := addr.String()
-	if addrPort, err := netip.ParseAddrPort(addrStr); err == nil {
-		return NewAddressAddrPort(addrPort), nil
-	}
-	metadata, err := protocol.ParseMetadata(addrStr)
-	if err != nil {
-		return &Address{}, err
-	}
-	return NewAddress(&metadata), nil
 }
 
 func NewAddressAddrPort(addrPort netip.AddrPort) *Address {

@@ -949,23 +949,7 @@ func TestE2EHysteria2UDPRelayIntegrityAndAddressing(t *testing.T) {
 		t.Fatalf("DialContext(udp) returned %T, want a PacketConn", pc)
 	}
 
-	expectDatagram := func(payload []byte, want net.Addr, label string) {
-		t.Helper()
-		buf := make([]byte, 65535)
-		if err := pc.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			t.Fatalf("%s: SetReadDeadline: %v", label, err)
-		}
-		n, from, err := packetConn.ReadFrom(buf)
-		if err != nil {
-			t.Fatalf("%s: ReadFrom: %v", label, err)
-		}
-		if n != len(payload) || string(buf[:n]) != string(payload) {
-			t.Fatalf("%s: datagram mismatch: n=%d want %d", label, n, len(payload))
-		}
-		if from.String() != want.String() {
-			t.Fatalf("%s: source = %v, want %v", label, from, want.String())
-		}
-	}
+	relay := newUDPRelaySession(t, packetConn)
 
 	// Small datagrams to the session's default target.
 	for i := 0; i < 10; i++ {
@@ -973,20 +957,14 @@ func TestE2EHysteria2UDPRelayIntegrityAndAddressing(t *testing.T) {
 		for j := range payload {
 			payload[j] = byte(i + j)
 		}
-		if _, err := packetConn.WriteTo(payload, echoA.String()); err != nil {
-			t.Fatalf("WriteTo default target: %v", err)
-		}
-		expectDatagram(payload, echoA, fmt.Sprintf("default target #%d", i))
+		relay.roundTrip(payload, echoA, fmt.Sprintf("default target #%d", i))
 	}
 
 	// Per-datagram addressing: the same session can target a second echo
 	// server, and replies must carry that source address.
 	for i := 0; i < 4; i++ {
 		payload := []byte(fmt.Sprintf("second-target-%02d", i))
-		if _, err := packetConn.WriteTo(payload, echoB.String()); err != nil {
-			t.Fatalf("WriteTo second target: %v", err)
-		}
-		expectDatagram(payload, echoB, fmt.Sprintf("second target #%d", i))
+		relay.roundTrip(payload, echoB, fmt.Sprintf("second target #%d", i))
 	}
 
 	// Near-MTU datagrams: 1300 and 1400 bytes of payload exceed the QUIC
@@ -999,10 +977,7 @@ func TestE2EHysteria2UDPRelayIntegrityAndAddressing(t *testing.T) {
 		for j := range payload {
 			payload[j] = byte(j * 13)
 		}
-		if _, err := packetConn.WriteTo(payload, echoA.String()); err != nil {
-			t.Fatalf("WriteTo large(%d): %v", size, err)
-		}
-		expectDatagram(payload, echoA, fmt.Sprintf("large %d", size))
+		relay.roundTrip(payload, echoA, fmt.Sprintf("large %d", size))
 	}
 }
 
@@ -1140,24 +1115,9 @@ func TestE2EHysteria2ObfsSalamander(t *testing.T) {
 	if !ok {
 		t.Fatalf("DialContext(udp) returned %T, want a PacketConn", pc)
 	}
+	relay := newUDPRelaySession(t, packetConn)
 	for i := 0; i < 4; i++ {
 		payload := []byte("obfs-udp-" + strconv.Itoa(i))
-		if _, err := packetConn.WriteTo(payload, udpEcho.String()); err != nil {
-			t.Fatalf("WriteTo: %v", err)
-		}
-		buf := make([]byte, 65535)
-		if err := pc.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			t.Fatalf("SetReadDeadline: %v", err)
-		}
-		n, from, err := packetConn.ReadFrom(buf)
-		if err != nil {
-			t.Fatalf("ReadFrom: %v", err)
-		}
-		if n != len(payload) || string(buf[:n]) != string(payload) {
-			t.Fatalf("datagram %d mismatch: n=%d", i, n)
-		}
-		if from.String() != udpEcho.String() {
-			t.Fatalf("datagram %d source = %v, want %v", i, from, udpEcho.String())
-		}
+		relay.roundTrip(payload, udpEcho, fmt.Sprintf("obfs udp #%d", i))
 	}
 }

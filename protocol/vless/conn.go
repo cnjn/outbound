@@ -187,7 +187,7 @@ func (c *Conn) Read(b []byte) (n int, err error) {
 			if err != nil {
 				return 0, err
 			}
-			return 0, fmt.Errorf("buf size is not enough")
+			return 0, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		// Read exactly one framed datagram: a plain c.read(b) here could
 		// return a partial or spanning chunk of the UDP-over-TCP stream.
@@ -259,6 +259,23 @@ func (c *Conn) ReadRespHeader() (err error) {
 	}
 	if _, err = io.CopyN(io.Discard, c.Conn, int64(buf[1])); err != nil {
 		return err
+	}
+	return nil
+}
+
+// ReadBuffered reports immediately-readable plaintext bytes by delegating
+// to the wrapped conn (the bufio layer owns the userspace queue for TLS
+// transports). It backs write-batching copy loops that must not issue
+// speculative reads or arm deadlines on record-framed streams.
+func (c *Conn) ReadBuffered() int {
+	return netproxy.ReadBuffered(c.Conn)
+}
+
+// UnderlyingConn peels to the wrapped conn so unwrap walks reach the
+// transport socket through the protocol layer.
+func (c *Conn) UnderlyingConn() net.Conn {
+	if u, ok := c.Conn.(netproxy.UnderlyingConnProvider); ok {
+		return u.UnderlyingConn()
 	}
 	return nil
 }

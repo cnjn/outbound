@@ -2,7 +2,6 @@ package shadowsocks_2022
 
 import (
 	"bytes"
-	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
@@ -12,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/daeuniverse/outbound/ciphers"
 	"github.com/daeuniverse/outbound/common"
 	"github.com/daeuniverse/outbound/common/iout"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -42,10 +40,8 @@ type TCPConn struct {
 	*SS2022Core // Embedded core for shared logic
 
 	net.Conn
-	addr  *socks5.AddressInfo
-	sg    shadowsocks.SaltGenerator
-	ctx   context.Context
-	ctxMu sync.RWMutex
+	addr *socks5.AddressInfo
+	sg   *shadowsocks.RandomSaltGenerator
 
 	cipherRead  cipher.AEAD
 	cipherWrite cipher.AEAD
@@ -74,37 +70,17 @@ type TCPConn struct {
 	bloom *disk_bloom.FilterGroup
 }
 
-type Key struct {
-	CipherConf *ciphers.CipherConf
-	MasterKey  []byte
-}
-
-func NewTCPConn(conn net.Conn, core *SS2022Core, sg shadowsocks.SaltGenerator, addr *socks5.AddressInfo, bloom *disk_bloom.FilterGroup) net.Conn {
-	return NewTCPConnWithContext(context.Background(), conn, core, sg, addr, bloom)
-}
-
-func NewTCPConnWithContext(ctx context.Context, conn net.Conn, core *SS2022Core, sg shadowsocks.SaltGenerator, addr *socks5.AddressInfo, bloom *disk_bloom.FilterGroup) net.Conn {
+func NewTCPConn(conn net.Conn, core *SS2022Core, sg *shadowsocks.RandomSaltGenerator, addr *socks5.AddressInfo, bloom *disk_bloom.FilterGroup) net.Conn {
 	tcpConn := &TCPConn{
 		SS2022Core: core,
 		Conn:       conn,
 		addr:       addr,
 		sg:         sg,
-		ctx:        context.Background(), // Use Background for TCP connections to avoid dial context expiry
 		nonceRead:  make([]byte, core.CipherConf().NonceLen),
 		nonceWrite: make([]byte, core.CipherConf().NonceLen),
 		bloom:      bloom,
 	}
 	return tcpConn
-}
-
-// getContext returns the current context, defaulting to background if not set
-func (c *TCPConn) getContext() context.Context {
-	c.ctxMu.RLock()
-	defer c.ctxMu.RUnlock()
-	if c.ctx != nil {
-		return c.ctx
-	}
-	return context.Background()
 }
 
 func (c *TCPConn) CloseWrite() error {
@@ -136,41 +112,19 @@ func (c *TCPConn) Close() error {
 	return err
 }
 
-// checkContextAndSetReadDeadline checks if the context is cancelled before a blocking read.
-// Returns true if the operation should proceed, false if it should be aborted.
-// Uses a rolling deadline for TCP I/O to avoid issues with the dial context's absolute deadline.
+// setHandshakeReadDeadline arms a rolling read deadline for TCP I/O.
 // Only used during the handshake: steady-state chunk reads must not impose a
-// per-chunk deadline (see checkContext), otherwise connections idle for more
-// than the rolling window are killed even though upper layers (relay
+// per-chunk deadline (see Read), otherwise connections idle for more than
+// the rolling window are killed even though upper layers (relay
 // watchdog, TCP keepalive) own liveness detection.
-func (c *TCPConn) checkContextAndSetReadDeadline() bool {
-	ctx := c.getContext()
-	select {
-	case <-ctx.Done():
-		return false
-	default:
-	}
+func (c *TCPConn) setHandshakeReadDeadline() {
 	if dl, ok := c.Conn.(interface{ SetReadDeadline(time.Time) error }); ok {
 		// Use a rolling deadline for TCP I/O operations.
-		// This ensures each read operation has sufficient time to complete,
-		// regardless of when the dial context was created.
+		// This ensures each read operation has sufficient time to complete.
 		// 30 seconds allows for high-latency networks while still detecting
 		// dead connections within a reasonable time.
 		_ = dl.SetReadDeadline(time.Now().Add(30 * time.Second))
 	}
-	return true
-}
-
-// checkContext reports whether the connection context is still alive.
-// Steady-state chunk reads use this instead of a rolling deadline so an idle
-// connection is not torn down by the protocol layer.
-func (c *TCPConn) checkContext() bool {
-	select {
-	case <-c.getContext().Done():
-		return false
-	default:
-	}
-	return true
 }
 
 // clearReadDeadline removes the handshake's rolling deadline once the first
@@ -181,25 +135,15 @@ func (c *TCPConn) clearReadDeadline() {
 	}
 }
 
-// checkContextAndSetWriteDeadline checks if the context is cancelled before a blocking write.
-// Returns true if the operation should proceed, false if it should be aborted.
-// Uses a rolling deadline for TCP I/O to avoid issues with the dial context's absolute deadline.
-func (c *TCPConn) checkContextAndSetWriteDeadline() bool {
-	ctx := c.getContext()
-	select {
-	case <-ctx.Done():
-		return false
-	default:
-	}
+// setHandshakeWriteDeadline arms a rolling write deadline for TCP I/O.
+func (c *TCPConn) setHandshakeWriteDeadline() {
 	if dl, ok := c.Conn.(interface{ SetWriteDeadline(time.Time) error }); ok {
 		// Use a rolling deadline for TCP I/O operations.
-		// This ensures each write operation has sufficient time to complete,
-		// regardless of when the dial context was created.
+		// This ensures each write operation has sufficient time to complete.
 		// 30 seconds allows for high-latency networks while still detecting
 		// dead connections within a reasonable time.
 		_ = dl.SetWriteDeadline(time.Now().Add(30 * time.Second))
 	}
-	return true
 }
 
 func encryptedPayloadLen(payloadLen, tagLen int) int {
@@ -287,59 +231,21 @@ func (c *TCPConn) borrowWriteFrame(size int) []byte {
 }
 
 func (c *TCPConn) writeIdentityHeaderTo(dst []byte, offset int, salt []byte) (int, error) {
-	// For AES ciphers, use the traditional block cipher EIH approach
-	if c.CipherConf().NewBlockCipher != nil {
-		for i := 0; i < len(c.PSKList())-1; i++ {
-			if offset+aes.BlockSize > len(dst) {
-				return 0, io.ErrShortBuffer
-			}
-			identitySubkey := GenerateSubKey(c.PSKList()[i], salt, Shadowsocks2022IdentityHeaderInfo)
-			b, err := c.CipherConf().NewBlockCipher(identitySubkey)
-			if err != nil {
-				PutSubKey(identitySubkey)
-				return 0, err
-			}
-			plaintext := blake3.Sum512(c.PSKList()[i+1])
-			b.Encrypt(dst[offset:offset+aes.BlockSize], plaintext[:aes.BlockSize])
-			PutSubKey(identitySubkey)
-			offset += aes.BlockSize
-		}
-		return offset, nil
-	}
-
-	// For Chacha cipher, use AEAD-based EIH
-	// The EIH is encrypted with AEAD and placed after salt
-	eihBlockSize := c.CipherConf().IdentityHeaderBlockSize
-	if eihBlockSize == 0 {
-		eihBlockSize = 16 // Default EIH block size
-	}
-
 	for i := 0; i < len(c.PSKList())-1; i++ {
-		if offset+eihBlockSize > len(dst) {
+		if offset+aes.BlockSize > len(dst) {
 			return 0, io.ErrShortBuffer
 		}
-
-		// Create AEAD cipher for EIH encryption using derived key
-		identityKey := GenerateSubKey(c.PSKList()[i], salt, Shadowsocks2022IdentityHeaderInfo)
-		aeadCipher, err := c.CipherConf().NewCipher(identityKey)
+		identitySubkey := GenerateSubKey(c.PSKList()[i], salt, Shadowsocks2022IdentityHeaderInfo)
+		b, err := c.CipherConf().NewBlockCipher(identitySubkey)
 		if err != nil {
-			PutSubKey(identityKey)
-			return 0, fmt.Errorf("failed to create EIH AEAD cipher: %w", err)
+			PutSubKey(identitySubkey)
+			return 0, err
 		}
-		PutSubKey(identityKey)
-
-		// Encrypt the next PSK's hash as EIH
-		// Use zero nonce for EIH (salt provides uniqueness)
-		eihNonce := make([]byte, c.CipherConf().NonceLen)
-		pskHash := blake3.Sum512(c.PSKList()[i+1])
-
-		// Seal the EIH block: the ciphertext includes the AEAD tag
-		_ = aeadCipher.Seal(dst[offset:offset], eihNonce, pskHash[:eihBlockSize], nil)
-
-		// Move offset by the EIH block size (not the full ciphertext length)
-		offset += eihBlockSize
+		plaintext := blake3.Sum512(c.PSKList()[i+1])
+		b.Encrypt(dst[offset:offset+aes.BlockSize], plaintext[:aes.BlockSize])
+		PutSubKey(identitySubkey)
+		offset += aes.BlockSize
 	}
-
 	return offset, nil
 }
 
@@ -376,39 +282,23 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 	var payloadLength uint16
 
 	if !c.onceRead {
-		if !c.checkContextAndSetReadDeadline() {
-			return 0, io.EOF
-		}
+		c.setHandshakeReadDeadline()
 		var saltBuf [32]byte
 		salt := saltBuf[:c.CipherConf().SaltLen]
 		n, err = io.ReadFull(c.Conn, salt)
 		if err != nil {
 			return 0, err
 		}
-		// Check context after read
-		select {
-		case <-c.getContext().Done():
-			return 0, c.getContext().Err()
-		default:
-		}
 		c.cipherRead, err = CreateCipher(c.UPSK(), salt, c.CipherConf())
 		if err != nil {
 			return 0, oops.Wrapf(err, "fail to initiate cipher")
 		}
 
-		if !c.checkContextAndSetReadDeadline() {
-			return 0, io.EOF
-		}
+		c.setHandshakeReadDeadline()
 		var headerBuf [11 + 32 + 16]byte
 		header := headerBuf[:11+c.CipherConf().SaltLen+c.CipherConf().TagLen]
 		if _, err := io.ReadFull(c.Conn, header); err != nil {
 			return 0, err
-		}
-		// Check context after read
-		select {
-		case <-c.getContext().Done():
-			return 0, c.getContext().Err()
-		default:
 		}
 		header, err := c.cipherRead.Open(header[:0], c.nonceRead, header, nil)
 		if err != nil {
@@ -455,24 +345,15 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 
 		c.onceRead = true
 	} else {
-		if !c.checkContext() {
-			return 0, io.EOF
-		}
 		// First steady-state chunk: the handshake (including its first
 		// payload read) is complete, so clear the rolling handshake
-		// deadline. Steady-state reads rely on ctx cancellation, TCP
-		// keepalive, and upper-layer idle watchdogs.
+		// deadline. Steady-state reads rely on TCP keepalive and
+		// upper-layer idle watchdogs.
 		c.clearReadDeadline()
 		var payloadLengthBuf [2 + 16]byte
 		payloadLengthRaw := payloadLengthBuf[:2+c.CipherConf().TagLen]
 		if _, err := io.ReadFull(c.Conn, payloadLengthRaw); err != nil {
 			return 0, err
-		}
-		// Check context after read
-		select {
-		case <-c.getContext().Done():
-			return 0, c.getContext().Err()
-		default:
 		}
 		payloadLengthPlain, err := c.cipherRead.Open(payloadLengthRaw[:0], c.nonceRead, payloadLengthRaw, nil)
 		if err != nil {
@@ -484,21 +365,12 @@ func (c *TCPConn) Read(b []byte) (n int, err error) {
 	}
 
 	if c.cipherRead == nil {
-		return 0, oops.Wrapf(err, "cipher is not initialized")
+		return 0, oops.New("cipher is not initialized")
 	}
 
-	if !c.checkContext() {
-		return 0, io.EOF
-	}
 	payload := c.ensureReadCipherBuf(int(payloadLength) + c.CipherConf().TagLen)
 	if _, err = io.ReadFull(c.Conn, payload); err != nil {
 		return 0, err
-	}
-	// Check context after read
-	select {
-	case <-c.getContext().Done():
-		return 0, c.getContext().Err()
-	default:
 	}
 	payload, err = c.cipherRead.Open(payload[:0], c.nonceRead, payload, nil)
 	if err != nil {
@@ -588,10 +460,7 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		common.BytesIncLittleEndian(c.nonceWrite)
 
 		offset += c.sealPayload(frame[offset:], remainingPayload)
-		if !c.checkContextAndSetWriteDeadline() {
-			c.writeBroken = true
-			return 0, io.EOF
-		}
+		c.setHandshakeWriteDeadline()
 		if _, err = iout.WriteFull(c.Conn, frame[:offset]); err != nil {
 			c.writeBroken = true
 			return 0, err
@@ -605,10 +474,7 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 	frameSize := encryptedPayloadLen(len(b), c.CipherConf().TagLen)
 	frame := c.borrowWriteFrame(frameSize)
 	offset := c.sealPayload(frame, b)
-	if !c.checkContextAndSetWriteDeadline() {
-		c.writeBroken = true
-		return 0, io.EOF
-	}
+	c.setHandshakeWriteDeadline()
 	if _, err = iout.WriteFull(c.Conn, frame[:offset]); err != nil {
 		c.writeBroken = true
 		return 0, err

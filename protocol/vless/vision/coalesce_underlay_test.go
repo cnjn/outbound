@@ -8,11 +8,12 @@ import (
 	"time"
 
 	"github.com/daeuniverse/outbound/netproxy"
-	"github.com/daeuniverse/outbound/pkg/coalesce"
 	"github.com/daeuniverse/outbound/protocol/vless/vision"
 )
 
-// tlsStageConn stands in for the raw underlay below the TLS layer.
+// tlsStageConn stands in for the raw underlay below the TLS layer. The chain
+// below never handshakes (no I/O is driven), so the TLS config is inert; a
+// plain config with a server name keeps certificate verification enabled.
 type tlsStageConn struct{}
 
 func (tlsStageConn) Read([]byte) (int, error)         { return 0, io.EOF }
@@ -26,17 +27,20 @@ func (tlsStageConn) SetWriteDeadline(time.Time) error { return nil }
 
 var _ net.Conn = tlsStageConn{}
 
-// TestNewConnAcceptsTransportTLSChain builds the exact conn shapes transport/tls
-// returns - the coalescer's FlushConn around the TLS conn, then the read
-// buffering layer the vless dialer adds - and requires Vision to accept the
-// chain. A wrapper that hides IntrinsicConn makes visionIntrinsicConn stop at
-// the wrapper and reject the underlay outright, so no vless+tls+xtls-rprx-vision
-// node can be dialed.
+// TestNewConnAcceptsTransportTLSChain builds the exact conn shapes
+// transport/tls returns - the TLS conn over the raw underlay, the
+// UnderlyingConnForwarder it is wrapped in, then the read buffering layer
+// the vless dialer adds - and requires Vision to accept the chain. A wrapper
+// that hides IntrinsicConn makes visionIntrinsicConn stop at the wrapper and
+// reject the underlay outright, so no vless+tls+xtls-rprx-vision node can be
+// dialed.
 func TestNewConnAcceptsTransportTLSChain(t *testing.T) {
-	co := coalesce.New(tlsStageConn{})
-	tlsConn := gotls.Client(co, &gotls.Config{InsecureSkipVerify: true})
-	flushConn := coalesce.NewFlushConn(tlsConn, co)
-	wrapped := netproxy.NewBufferedReaderConn(flushConn, 0)
+	tlsConn := gotls.Client(&netproxy.FakeNetConn{Conn: tlsStageConn{}},
+		&gotls.Config{ServerName: "underlay.test"})
+	fwd := netproxy.NewUnderlyingConnForwarder(tlsConn, func() net.Conn {
+		return nil
+	})
+	wrapped := netproxy.NewBufferedReaderConn(fwd, 0)
 
 	// The chain must still resolve to the TLS conn: that is what Vision
 	// reflects on for the record-buffer splice.

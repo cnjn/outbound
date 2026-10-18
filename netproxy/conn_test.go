@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/netip"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -108,4 +109,24 @@ func TestFakeNetPacketConnForwardsPacketReceiver(t *testing.T) {
 	if !inner.stopped.Load() {
 		t.Fatal("underlying packet receiver was not unregistered")
 	}
+}
+
+func TestTCPDialControl(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	dialer := net.Dialer{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return TCPDialControl(c, 0)
+		},
+	}
+
+	conn, err := dialer.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial failed with TCPDialControl: %v", err)
+	}
+	defer conn.Close()
 }

@@ -23,23 +23,28 @@ func (c *Conn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 		}
 		return n, tgt, nil
 	}
-	buf := pool.Get(MaxUDPSize)
-	defer pool.Put(buf)
-	n, err = c.read(buf)
+	// Read the datagram straight into the caller's buffer. Staging it through a
+	// pooled MaxUDPSize (2048) frame buffer capped every packetaddr datagram at
+	// 2048 bytes regardless of the caller's capacity, so larger replies (for
+	// example EDNS0 DNS answers) were drained and reported as dropped. c.read
+	// already reports a caller-side short buffer as a typed datagram-dropped
+	// error, so no copy or cap is needed here.
+	n, err = c.read(p)
 	if err != nil {
 		return 0, netip.AddrPort{}, err
 	}
-	addrTyp, address, err := ExtractPacketAddr(buf)
-	addrLen := PacketAddrLength(addrTyp)
-	if n < addrLen {
+	if n == 0 {
 		return 0, netip.AddrPort{}, fmt.Errorf("not enough data to read for PacketAddr")
 	}
-	payload := n - addrLen
-	copied := copy(p, buf[addrLen:n])
-	if copied < payload {
-		return copied, address, fmt.Errorf("buf size is not enough")
+	addrTyp, address, err := ExtractPacketAddr(p[:n])
+	if err != nil {
+		return 0, netip.AddrPort{}, err
 	}
-	return copied, address, err
+	// ExtractPacketAddr rejects a datagram shorter than its own packet address,
+	// so addrLen <= n here. The address is a prefix of the datagram; compacting
+	// it out is a forward-overlapping copy, which copy handles correctly.
+	addrLen := PacketAddrLength(addrTyp)
+	return copy(p, p[addrLen:n]), address, nil
 }
 
 func (c *Conn) WriteTo(p []byte, addr string) (n int, err error) {
@@ -81,7 +86,7 @@ func (c *Conn) writeTargetAddrPort(addr string) (*net.UDPAddr, error) {
 	}
 	addrPort := unmapAddrPort(target.AddrPort())
 	c.writeCache.Store(addr, addrPort)
-	return target, nil
+	return net.UDPAddrFromAddrPort(addrPort), nil
 }
 
 // WriteBatch implements netproxy.PacketBatchWriter: seal several datagrams

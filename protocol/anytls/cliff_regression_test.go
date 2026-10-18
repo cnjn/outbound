@@ -13,14 +13,6 @@ import (
 // ~73832 B/op because the encoded frame overflowed the pool and forced a heap
 // allocation per write; post-fix is ~48 B/op. TotalAlloc is deterministic and
 // machine-independent, so this assertion is not fragile like a ns/op threshold.
-//
-// Since the session writer pipeline, a write returns at enqueue and the
-// steady state is what must stay allocation-free: the loop drains the
-// writer each iteration so the measured cost is the recycled steady path
-// (payload buffers handed back through the session recycle channel), not
-// the pipeline's bounded in-flight working set filling up. A frame size
-// regressing past the pool's largest bucket still forces a fresh heap
-// allocation on every payload copy and fails the budget.
 func TestAnytlsWriteNoAllocCliff(t *testing.T) {
 	sess := newSession(bench.NewNetDiscardConn(), 0)
 	stream, err := sess.newStream("127.0.0.1:8080")
@@ -28,12 +20,9 @@ func TestAnytlsWriteNoAllocCliff(t *testing.T) {
 		t.Fatalf("newStream: %v", err)
 	}
 	payload := make([]byte, 65536)
-	for range 4 {
-		if _, err := stream.Write(payload); err != nil {
-			t.Fatalf("warmup write: %v", err)
-		}
+	if _, err := stream.Write(payload); err != nil {
+		t.Fatalf("warmup write: %v", err)
 	}
-	sess.wq.waitDrain()
 
 	const runs = 100
 	var m1, m2 runtime.MemStats
@@ -43,7 +32,6 @@ func TestAnytlsWriteNoAllocCliff(t *testing.T) {
 		if _, err := stream.Write(payload); err != nil {
 			t.Fatalf("write: %v", err)
 		}
-		sess.wq.waitDrain()
 	}
 	runtime.ReadMemStats(&m2)
 

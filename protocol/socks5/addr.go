@@ -1,7 +1,6 @@
 package socks5
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,7 +13,9 @@ import (
 
 type AddressType uint8
 
-// Address type constants for Shadowsocks protocol
+// Address type constants for the SOCKS-style address codec. The encode side
+// consumed by shadowsocks_2022 lives in that package (writeAddrInfoTo); this
+// file provides the decode side (ReadAddr/ReadAddrInfo) and AddressFromString.
 const (
 	AddressTypeIPv4   AddressType = 1
 	AddressTypeDomain AddressType = 3
@@ -31,53 +32,6 @@ type AddressInfo struct {
 	Hostname string
 	IP       netip.Addr
 	Port     uint16
-}
-
-func WriteAddr(addr string, buf *bytes.Buffer) error {
-	addressInfo, err := AddressFromString(addr)
-	if err != nil {
-		return err
-	}
-	return WriteAddrInfo(addressInfo, buf)
-}
-
-// WriteAddrInfo writes address information to writer
-func WriteAddrInfo(addr *AddressInfo, w io.Writer) error {
-	var typeBuf [1]byte
-	typeBuf[0] = byte(addr.Type)
-	if _, err := w.Write(typeBuf[:]); err != nil {
-		return err
-	}
-
-	switch addr.Type {
-	case AddressTypeIPv4, AddressTypeIPv6:
-		if _, err := w.Write(addr.IP.AsSlice()); err != nil {
-			return err
-		}
-		var portBuf [2]byte
-		binary.BigEndian.PutUint16(portBuf[:], addr.Port)
-		_, err := w.Write(portBuf[:])
-		return err
-	case AddressTypeDomain:
-		lenDN := len(addr.Hostname)
-		if lenDN > 255 {
-			return fmt.Errorf("domain name too long: %d bytes", lenDN)
-		}
-		var lenBuf [1]byte
-		lenBuf[0] = uint8(lenDN)
-		if _, err := w.Write(lenBuf[:]); err != nil {
-			return err
-		}
-		if _, err := io.WriteString(w, addr.Hostname); err != nil {
-			return err
-		}
-		var portBuf [2]byte
-		binary.BigEndian.PutUint16(portBuf[:], addr.Port)
-		_, err := w.Write(portBuf[:])
-		return err
-	default:
-		return fmt.Errorf("unsupported address type: %v", addr.Type)
-	}
 }
 
 func ReadAddr(data io.Reader) (net.Addr, error) {

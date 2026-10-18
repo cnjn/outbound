@@ -479,7 +479,19 @@ func (b *Bbr3Sender) recalc() {
 		if cur == modeProbeBWUp && !b.params.StrictHintCap {
 			capFactor = b.params.HintProbeOvershoot
 		}
-		capCwnd := congestion.ByteCount(float64(b.hint) * m.minRttValue().Seconds() * b.params.CwndGain * capFactor)
+		// Size the budget with the same divergence-aware RTT the floor
+		// above uses: on a path whose smoothed RTT has risen past minRTT,
+		// a minRTT-sized in-flight budget under-fills the pipe at the very
+		// hint rate it is supposed to permit, and the cap would cut the
+		// srtt-based floor support back below what the window needs
+		// (b141c8a's floor protection, mirrored on the cap side).
+		capRTT := m.minRttValue()
+		if b.rttStats != nil {
+			if srtt := b.rttStats.SmoothedRTT(); srtt > capRTT {
+				capRTT = srtt
+			}
+		}
+		capCwnd := congestion.ByteCount(float64(b.hint) * capRTT.Seconds() * b.params.CwndGain * capFactor)
 		if capCwnd < m.minCwnd {
 			capCwnd = m.minCwnd
 		}

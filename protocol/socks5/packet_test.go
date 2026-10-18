@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"errors"
 	"io"
 	"net"
 	"net/netip"
@@ -369,5 +370,33 @@ func TestPktConnReadFromDecodesFramedReply(t *testing.T) {
 	}
 	if from != (netip.AddrPortFrom(netip.MustParseAddr("198.51.100.7"), 443)) {
 		t.Fatalf("from = %v, want 198.51.100.7:443", from)
+	}
+}
+
+// TestPktConnReadFromMalformedDatagramIsDropped pins the typed contract for
+// malformed SOCKS UDP replies: a too-short header, a non-zero FRAG byte, or an
+// unparseable target address is one dropped datagram, not a session failure —
+// the endpoint must stay alive for the next well-formed reply.
+func TestPktConnReadFromMalformedDatagramIsDropped(t *testing.T) {
+	cases := []struct {
+		name  string
+		frame []byte
+	}{
+		{"truncated header", []byte{0x00, 0x00}},
+		{"non-zero FRAG", []byte{0x00, 0x00, 0x02, 0x01, 198, 51, 100, 7, 0x01, 0xBB, 'x'}},
+		{"unparseable address", []byte{0x00, 0x00, 0x00, 0x99, 0x01}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pc := &PktConn{PacketConn: &scriptedReplyPacketConn{frame: tc.frame}}
+			_, _, err := pc.ReadFrom(make([]byte, 64))
+			if err == nil {
+				t.Fatal("malformed datagram must be reported")
+			}
+			var dropped *netproxy.ErrDatagramDropped
+			if !errors.As(err, &dropped) {
+				t.Fatalf("malformed datagram must carry the datagram-dropped contract, got %T: %v", err, err)
+			}
+		})
 	}
 }

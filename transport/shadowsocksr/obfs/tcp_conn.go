@@ -14,9 +14,8 @@ import (
 
 type Conn struct {
 	netproxy.Conn
-	Obfs                IObfs
-	underPostdecryptBuf *bytes.Buffer
-	readLater           io.Reader
+	Obfs      IObfs
+	readLater io.Reader
 
 	init        bool
 	writeBroken bool
@@ -29,10 +28,9 @@ type Conn struct {
 
 func NewConn(c netproxy.Conn, obfs IObfs) (*Conn, error) {
 	return &Conn{
-		Conn:                c,
-		Obfs:                obfs,
-		underPostdecryptBuf: new(bytes.Buffer),
-		addrLen:             30,
+		Conn:    c,
+		Obfs:    obfs,
+		addrLen: 30,
 	}, nil
 }
 

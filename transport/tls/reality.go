@@ -42,10 +42,11 @@ import (
 	"golang.org/x/net/http2"
 )
 
-var (
-	Reality_Version_x byte = 1
-	Reality_Version_y byte = 8
-	Reality_Version_z byte = 10
+// Reality protocol version bytes embedded in the ClientHello session ID.
+const (
+	realityVersionX byte = 1
+	realityVersionY byte = 8
+	realityVersionZ byte = 10
 )
 
 // realityHelloAttempts bounds how many ClientHellos the dialer generates before
@@ -404,9 +405,9 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 			hello := uConn.HandshakeState.Hello
 			hello.SessionId = make([]byte, 32)
 			copy(hello.Raw[39:], hello.SessionId) // the fixed location of `Session ID`
-			hello.SessionId[0] = Reality_Version_x
-			hello.SessionId[1] = Reality_Version_y
-			hello.SessionId[2] = Reality_Version_z
+			hello.SessionId[0] = realityVersionX
+			hello.SessionId[1] = realityVersionY
+			hello.SessionId[2] = realityVersionZ
 			hello.SessionId[3] = 0 // reserved
 			binary.BigEndian.PutUint32(hello.SessionId[4:], uint32(time.Now().Unix()))
 			copy(hello.SessionId[8:], x.shortId[:])
@@ -487,21 +488,21 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 					},
 				}
 				prefix := []byte("https://" + uConn.ServerName)
-				maps.Lock()
-				if maps.maps == nil || maps.bytes == nil {
-					maps.maps = make(map[string]map[string]bool)
-					maps.bytes = make(map[string]int)
-				}
-				paths := maps.maps[uConn.ServerName]
-				if paths == nil {
-					paths = make(map[string]bool)
-					paths[x.spiderX] = true
-					maps.maps[uConn.ServerName] = paths
-					maps.bytes[uConn.ServerName] = len(x.spiderX)
-				}
-				firstURL := string(prefix) + getPathLocked(paths)
-				maps.Unlock()
+				paths, firstPath := spiderPathsFor(uConn.ServerName, x.spiderX)
+				firstURL := string(prefix) + firstPath
 				get := func(first bool) {
+					// The !first requests each run on their own goroutine and
+					// outlive the handshake, so a panic here would take the
+					// whole process down; contain it and report it instead.
+					defer func() {
+						if r := recover(); r != nil {
+							logger.Logger.WithFields(map[string]any{
+								"server_name": uConn.ServerName,
+								"panic":       fmt.Sprint(r),
+								"stack":       string(debug.Stack()),
+							}).Error("REALITY: panic in spider request")
+						}
+					}()
 					var (
 						req  *http.Request
 						resp *http.Response
@@ -512,9 +513,7 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 					if first {
 						target = firstURL
 					} else {
-						maps.Lock()
-						target = string(prefix) + getPathLocked(paths)
-						maps.Unlock()
+						target = string(prefix) + spiderNextPath(paths)
 					}
 					// The harvested paths are peer-controlled (href values
 					// scraped from the backdrop), so an unbuildable request
@@ -555,21 +554,12 @@ func (x *Reality) DialContext(ctx context.Context, network, addr string) (c netp
 						}
 						_ = resp.Body.Close()
 						cancelReq()
-						maps.Lock()
-						for _, m := range href.FindAllSubmatch(body, -1) {
-							m[1] = bytes.TrimPrefix(m[1], prefix)
-							if spiderPathRetained(paths, maps.bytes[uConn.ServerName], m[1]) {
-								paths[string(m[1])] = true
-								maps.bytes[uConn.ServerName] += len(m[1])
-							}
-						}
-						req.URL.Path = getPathLocked(paths)
+						req.URL.Path = spiderHarvest(uConn.ServerName, paths, prefix, body)
 						// if config.Show {
 						// 	newError(fmt.Sprintf("REALITY localAddr: %v\treq.Referer(): %v\n", localAddr, req.Referer())).WriteToLog(session.ExportIDToError(ctx))
 						// 	newError(fmt.Sprintf("REALITY localAddr: %v\tlen(body): %v\n", localAddr, len(body))).WriteToLog(session.ExportIDToError(ctx))
 						// 	newError(fmt.Sprintf("REALITY localAddr: %v\tlen(paths): %v\n", localAddr, len(paths))).WriteToLog(session.ExportIDToError(ctx))
 						// }
-						maps.Unlock()
 						if !first {
 							time.Sleep(time.Duration(randBetween(x.spiderY[6], x.spiderY[7])) * time.Millisecond) // interval
 						}
@@ -646,6 +636,54 @@ func getPathLocked(paths map[string]bool) string {
 		i++
 	}
 	return "/"
+}
+
+// spiderPathsFor returns serverName's harvested path set, creating it and
+// seeding it with spiderX on first use, together with the first request path.
+// The maps lock is taken and released inside, by defer: the recover that
+// contains a panic in the spider goroutines sits outside this critical section,
+// so an unlock skipped by a panic would outlive the recovered panic and wedge
+// every later spider access.
+func spiderPathsFor(serverName, spiderX string) (map[string]bool, string) {
+	maps.Lock()
+	defer maps.Unlock()
+	if maps.maps == nil || maps.bytes == nil {
+		maps.maps = make(map[string]map[string]bool)
+		maps.bytes = make(map[string]int)
+	}
+	paths := maps.maps[serverName]
+	if paths == nil {
+		paths = make(map[string]bool)
+		paths[spiderX] = true
+		maps.maps[serverName] = paths
+		maps.bytes[serverName] = len(spiderX)
+	}
+	return paths, getPathLocked(paths)
+}
+
+// spiderNextPath returns the next request path from the path set. The harvest
+// goroutines write that map, so getPathLocked reads it under the maps lock, and
+// the unlock is deferred for the panic-safety reason above.
+func spiderNextPath(paths map[string]bool) string {
+	maps.Lock()
+	defer maps.Unlock()
+	return getPathLocked(paths)
+}
+
+// spiderHarvest merges the hrefs of one backdrop body into the path set and
+// returns the next request path. The merge and the path pick run under the maps
+// lock, which is released by defer for the panic-safety reason above.
+func spiderHarvest(serverName string, paths map[string]bool, prefix, body []byte) string {
+	maps.Lock()
+	defer maps.Unlock()
+	for _, m := range href.FindAllSubmatch(body, -1) {
+		m[1] = bytes.TrimPrefix(m[1], prefix)
+		if spiderPathRetained(paths, maps.bytes[serverName], m[1]) {
+			paths[string(m[1])] = true
+			maps.bytes[serverName] += len(m[1])
+		}
+	}
+	return getPathLocked(paths)
 }
 
 func randBetween(left int64, right int64) int64 {

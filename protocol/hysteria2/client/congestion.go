@@ -67,8 +67,7 @@ func ValidateCongestionOverride(override string) error {
 //     downgrade would hide a typo.
 //
 // The returned tx is the target handed to the installer (brutal target or bbr3
-// hint) and is reported through HandshakeInfo.Tx; it is zero when no target
-// applies.
+// hint); it is zero when no target applies.
 func resolveCongestion(override string, rxAuto bool, serverRx, clientTx uint64) (string, uint64, error) {
 	if err := ValidateCongestionOverride(override); err != nil {
 		return "", 0, err

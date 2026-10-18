@@ -132,11 +132,11 @@ func (u *udpConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) {
 		}
 		if len(dfMsg.Data) > len(p) {
 			// The datagram is consumed either way; a short caller buffer
-			// must surface as ErrShortBuffer, not as a silently truncated
-			// packet.
+			// must surface as the datagram-dropped contract, not as a
+			// silently truncated packet.
 			n := copy(p, dfMsg.Data)
 			releaseUDPMessage(dfMsg)
-			return n, from, io.ErrShortBuffer
+			return n, from, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		n := copy(p, dfMsg.Data)
 		releaseUDPMessage(dfMsg)

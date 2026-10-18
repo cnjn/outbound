@@ -28,9 +28,9 @@ func TestPacerInitialBudgetIsMaxBurst(t *testing.T) {
 	if got != want {
 		t.Fatalf("initial Budget = %d, want maxBurstSize %d", got, want)
 	}
-	if got < maxBurstPackets*congestion.InitialPacketSizeIPv4 {
+	if got < maxBurstPackets*congestion.InitialPacketSize {
 		t.Fatalf("initial Budget = %d, want at least %d bytes (%d packets)",
-			got, maxBurstPackets*congestion.InitialPacketSizeIPv4, maxBurstPackets)
+			got, maxBurstPackets*congestion.InitialPacketSize, maxBurstPackets)
 	}
 	if !p.TimeUntilSend().IsZero() {
 		t.Fatal("TimeUntilSend before any send must report send-now")

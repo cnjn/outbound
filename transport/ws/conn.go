@@ -16,23 +16,11 @@ type conn struct {
 	currentReader io.Reader
 
 	writeMu sync.Mutex
-	// flusher, when set, drains the record coalescer sitting under the
-	// websocket transport (TLS records for wss, raw TCP segments for
-	// plain ws). gorilla emits one socket write per ~4KB frame, so a
-	// 32KB application write costs eight syscalls without it.
-	flusher interface{ Flush() error }
 }
 
 func newConn(wsc *websocket.Conn) *conn {
 	return &conn{
 		Conn: wsc,
-	}
-}
-
-func newConnWithFlusher(wsc *websocket.Conn, f interface{ Flush() error }) *conn {
-	return &conn{
-		Conn:    wsc,
-		flusher: f,
 	}
 }
 
@@ -95,11 +83,6 @@ func (c *conn) Write(b []byte) (n int, err error) {
 	}
 	if closeErr != nil {
 		return n, closeErr
-	}
-	if c.flusher != nil {
-		if ferr := c.flusher.Flush(); ferr != nil {
-			return n, normalizeWebsocketError(ferr)
-		}
 	}
 	return n, nil
 }

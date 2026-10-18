@@ -22,22 +22,23 @@ type MagicNetwork struct {
 }
 
 func (mn MagicNetwork) Encode() string {
-	if len([]byte(mn.Network)) > 255 {
+	networkLen := len(mn.Network)
+	if networkLen > 255 {
 		panic("network too long")
 	}
 	if len(mn.IPVersion) > 1 {
 		panic("ip version too long")
 	}
-	b := make([]byte, 2+len(mn.Network)+4+1+1)
+	b := make([]byte, 2+networkLen+4+1+1)
 	b[0] = MagicNetworkType
-	b[1] = byte(len([]byte(mn.Network)))
+	b[1] = byte(networkLen)
 	copy(b[2:], mn.Network)
-	binary.BigEndian.PutUint32(b[2+len([]byte(mn.Network)):], uint32(mn.Mark))
+	binary.BigEndian.PutUint32(b[2+networkLen:], uint32(mn.Mark))
 	if mn.Mptcp {
-		b[2+len([]byte(mn.Network))+4] = 1
+		b[2+networkLen+4] = 1
 	}
 	if len(mn.IPVersion) == 1 {
-		b[2+len([]byte(mn.Network))+5] = mn.IPVersion[0]
+		b[2+networkLen+5] = mn.IPVersion[0]
 	}
 	return string(b)
 }
@@ -55,7 +56,7 @@ func ParseMagicNetwork(network string) (mn *MagicNetwork, err error) {
 		}, nil
 	}
 	b := []byte(network)
-	if len(b) < 2 || b[0] != MagicNetworkType {
+	if len(b) < 2 {
 		return nil, UnknownMagicNetworkEncodingError
 	}
 	// flag(1B) network len (1B) network (variable length) mark(4B) mptcp(1B) ip_version(1B, optional)

@@ -68,7 +68,7 @@ type Dialer struct {
 	parentDialer netproxy.Dialer
 	proxyAddress string
 	core         *SS2022Core
-	sg           shadowsocks.SaltGenerator
+	sg           *shadowsocks.RandomSaltGenerator
 }
 
 func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.Dialer, error) {
@@ -96,10 +96,7 @@ func NewDialer(parentDialer netproxy.Dialer, header protocol.Header) (netproxy.D
 	if err != nil {
 		return nil, err
 	}
-	sg, err := shadowsocks.NewRandomSaltGenerator(conf.SaltLen)
-	if err != nil {
-		return nil, err
-	}
+	sg := shadowsocks.NewRandomSaltGenerator(conf.SaltLen)
 	return &Dialer{
 		parentDialer: parentDialer,
 		proxyAddress: header.ProxyAddress,
@@ -146,7 +143,7 @@ func (d *Dialer) DialContext(ctx context.Context, network, addr string) (netprox
 			_ = conn.Close()
 			return nil, fmt.Errorf("shadowsocks_2022: TCP underlay does not implement net.Conn: %T", conn)
 		}
-		return NewTCPConnWithContext(ctx, netConn, d.core, d.sg, addrInfo, nil), nil
+		return NewTCPConn(netConn, d.core, d.sg, addrInfo, nil), nil
 	case "udp":
 		conn, err := d.ListenPacket(ctx, network, d.proxyAddress)
 		if err != nil {
@@ -174,5 +171,13 @@ func (d *Dialer) ListenPacket(ctx context.Context, network string, addr string) 
 	if err != nil {
 		return nil, err
 	}
-	return NewUdpConnWithContext(ctx, conn.(net.Conn), d.core, nil)
+	// UdpConn embeds net.Conn; a future parent wrapper that does not carry
+	// the address accessors must surface as a dial error, not a panic (the
+	// TCP branch above turns the same condition into an error).
+	netConn, ok := conn.(net.Conn)
+	if !ok {
+		_ = conn.Close()
+		return nil, fmt.Errorf("shadowsocks_2022: UDP underlay does not implement net.Conn: %T", conn)
+	}
+	return NewUdpConn(netConn, d.core, nil)
 }

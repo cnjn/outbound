@@ -59,7 +59,7 @@ type model struct {
 
 func newModel(params Params, maxDatagramSize congestion.ByteCount) *model {
 	if maxDatagramSize <= 0 {
-		maxDatagramSize = congestion.InitialPacketSizeIPv4
+		maxDatagramSize = congestion.InitialPacketSize
 	}
 	return &model{
 		params:          params,

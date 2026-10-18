@@ -40,7 +40,7 @@ type UdpConn struct {
 	cipherConf *ciphers.CipherConf
 	masterKey  []byte
 	bloom      *disk_bloom.FilterGroup
-	sg         SaltGenerator
+	sg         *RandomSaltGenerator
 
 	tgtAddr string
 	target  common.LastStringValue[protocol.Metadata]
@@ -136,10 +136,7 @@ func NewUdpConn(conn netproxy.PacketConn, proxyAddress string, metadata protocol
 	}
 	key := make([]byte, len(masterKey))
 	copy(key, masterKey)
-	sg, err := NewRandomSaltGenerator(conf.SaltLen)
-	if err != nil {
-		return nil, err
-	}
+	sg := NewRandomSaltGenerator(conf.SaltLen)
 	c := &UdpConn{
 		PacketConn:   conn,
 		proxyAddress: proxyAddress,

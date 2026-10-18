@@ -13,15 +13,12 @@ type fakeRTT struct {
 	latest   time.Duration
 }
 
-func (f *fakeRTT) MinRTT() time.Duration                       { return f.latest }
-func (f *fakeRTT) LatestRTT() time.Duration                    { return f.latest }
-func (f *fakeRTT) SmoothedRTT() time.Duration                  { return f.smoothed }
-func (f *fakeRTT) MeanDeviation() time.Duration                { return 0 }
-func (f *fakeRTT) MaxAckDelay() time.Duration                  { return 0 }
-func (f *fakeRTT) PTO(bool) time.Duration                      { return 0 }
-func (f *fakeRTT) UpdateRTT(sendDelta, ackDelay time.Duration) {}
-func (f *fakeRTT) SetMaxAckDelay(time.Duration)                {}
-func (f *fakeRTT) SetInitialRTT(time.Duration)                 {}
+func (f *fakeRTT) MinRTT() time.Duration        { return f.latest }
+func (f *fakeRTT) LatestRTT() time.Duration     { return f.latest }
+func (f *fakeRTT) SmoothedRTT() time.Duration   { return f.smoothed }
+func (f *fakeRTT) MeanDeviation() time.Duration { return 0 }
+func (f *fakeRTT) MaxAckDelay() time.Duration   { return 0 }
+func (f *fakeRTT) PTO(bool) time.Duration       { return 0 }
 
 func newBrutal(bps uint64, rtt time.Duration) (*BrutalSender, *fakeRTT) {
 	b := NewBrutalSender(bps)

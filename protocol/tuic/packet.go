@@ -2,6 +2,7 @@ package tuic
 
 import (
 	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -627,9 +628,15 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 				packet.releaseData()
 				continue
 			}
+			full := len(packet.DATA)
 			n := copy(p, packet.DATA)
 			addr := packet.ADDR.UDPAddrPort()
 			packet.releaseData()
+			if full > len(p) {
+				// The datagram is consumed either way; delivering the truncated
+				// bytes as success would corrupt it silently. Surface the drop.
+				return n, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
+			}
 			return n, addr, nil
 		}
 		nowNano := time.Now().UnixNano()
@@ -655,6 +662,11 @@ func (q *quicStreamPacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, e
 				buffer.Put()
 				if bucket.len() == 0 {
 					q.deFraggers.CompareAndDelete(packet.PKT_ID, bucket)
+				}
+				// Caller buffer smaller than the reassembled datagram:
+				// surface the drop instead of silently corrupting it.
+				if n > len(p) {
+					return copyN, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
 				}
 				return copyN, addr, nil
 			}

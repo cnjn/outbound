@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -329,7 +330,7 @@ func TestUDPHopPacketConnFreezesResolvedIPForSubsequentHops(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewUDPHopPacketConn() error = %v", err)
 	}
-	hConn := conn.(*udpHopPacketConn)
+	hConn := conn.(*oobBlindPacketConn).PacketConn.(*udpHopPacketConn)
 	defer func() { _ = hConn.Close() }()
 
 	gotRemoteAddr := hConn.RemoteAddr()
@@ -462,5 +463,64 @@ func TestUDPHopPacketConnCloseDoesNotWaitForNonCooperativeHopDial(t *testing.T) 
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("hop did not return after releasing dial")
+	}
+}
+
+// TestNewUDPHopPacketConnHidesOOBOnProxiedUnderlay pins the capability
+// contract of the returned conn: when the underlay has no raw socket fd
+// (proxied transports), the hop conn must not advertise SyscallConn,
+// OOBCapablePacketConn, or batch reads. quic-go probes exactly these method
+// sets and would otherwise take the optimized sendmsg/recvmmsg path whose
+// first syscall fails, aborting the QUIC dial. On a raw-socket underlay the
+// capability must stay exposed for the batching fast path.
+func TestNewUDPHopPacketConnHidesOOBOnProxiedUnderlay(t *testing.T) {
+	addr := &UDPHopAddr{Host: "example.com", Ports: []uint16{443}, PortStr: "443"}
+	dialFunc := func(_ context.Context, _ net.Addr) (net.PacketConn, error) {
+		return &stubRemotePacketConn{}, nil
+	}
+	conn, err := NewUDPHopPacketConnContext(context.Background(), addr, 5*time.Second, dialFunc)
+	if err != nil {
+		t.Fatalf("NewUDPHopPacketConnContext() error = %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, ok := conn.(syscall.Conn); ok {
+		t.Error("proxied underlay must not advertise a raw socket (syscall.Conn)")
+	}
+	if _, ok := conn.(interface {
+		ReadMsgUDP(b, oob []byte) (n, oobn int, flags int, addr *net.UDPAddr, err error)
+	}); ok {
+		t.Error("proxied underlay must not advertise OOB reads (quic.OOBCapablePacketConn)")
+	}
+	if _, ok := conn.(interface {
+		SetReadBuffer(int) error
+	}); ok {
+		t.Error("proxied underlay must not advertise SetReadBuffer")
+	}
+
+	// The portable surface stays available.
+	udpAddr := &net.UDPAddr{IP: net.ParseIP("203.0.113.10"), Port: 443}
+	if _, err := conn.WriteTo([]byte("x"), udpAddr); err != nil {
+		t.Fatalf("WriteTo() error = %v", err)
+	}
+}
+
+// TestNewUDPHopPacketConnKeepsOOBOnDirectUnderlay verifies the opposite side:
+// a raw-socket underlay keeps the optimized method set so direct dials keep
+// the batching fast path.
+func TestNewUDPHopPacketConnKeepsOOBOnDirectUnderlay(t *testing.T) {
+	addr := &UDPHopAddr{Host: "example.com", Ports: []uint16{443}, PortStr: "443"}
+	dialFunc := func(_ context.Context, _ net.Addr) (net.PacketConn, error) {
+		// A real UDP socket has a raw fd and satisfies syscall.Conn.
+		return net.ListenPacket("udp", "127.0.0.1:0")
+	}
+	conn, err := NewUDPHopPacketConnContext(context.Background(), addr, 5*time.Second, dialFunc)
+	if err != nil {
+		t.Fatalf("NewUDPHopPacketConnContext() error = %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	if _, ok := conn.(syscall.Conn); !ok {
+		t.Error("direct underlay must keep advertising the raw socket")
 	}
 }

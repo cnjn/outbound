@@ -97,19 +97,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 		config.ConnFactory = &client.UdpConnFactory{
 			NewFunc: func(ctx context.Context) (net.PacketConn, error) {
 				dialFunc := func(ctx context.Context, addr net.Addr) (net.PacketConn, error) {
-					conn, err := nextDialer.DialContext(ctx, "udp", addr.String())
-					if err != nil {
-						return nil, err
-					}
-					remoteAddr := addr
-					if actualAddr := remoteAddrOf(conn); actualAddr != nil {
-						remoteAddr = actualAddr
-					}
-					return netproxy.NewFakeNetPacketConn(
-						conn.(netproxy.PacketConn),
-						net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
-						remoteAddr,
-					), nil
+					return dialWrappedUDPConn(ctx, nextDialer, addr)
 				}
 				return udphop.NewUDPHopPacketConnContext(ctx, config.ServerAddr.(*udphop.UDPHopAddr), config.UDPHopInterval, dialFunc)
 			},
@@ -117,19 +105,7 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 	} else {
 		config.ConnFactory = &client.UdpConnFactory{
 			NewFunc: func(ctx context.Context) (net.PacketConn, error) {
-				conn, err := nextDialer.DialContext(ctx, "udp", config.ServerAddr.String())
-				if err != nil {
-					return nil, err
-				}
-				remoteAddr := config.ServerAddr
-				if addr := remoteAddrOf(conn); addr != nil {
-					remoteAddr = addr
-				}
-				return netproxy.NewFakeNetPacketConn(
-					conn.(netproxy.PacketConn),
-					net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
-					remoteAddr,
-				), nil
+				return dialWrappedUDPConn(ctx, nextDialer, config.ServerAddr)
 			},
 		}
 	}
@@ -179,6 +155,25 @@ func remoteAddrOf(conn netproxy.Conn) net.Addr {
 		return c.RemoteAddr()
 	}
 	return nil
+}
+
+// dialWrappedUDPConn dials the server over UDP through nextDialer and wraps
+// the resulting conn in a FakeNetPacketConn with a unique fake local address.
+// The conn's actual remote address is preferred over the requested one.
+func dialWrappedUDPConn(ctx context.Context, nextDialer netproxy.Dialer, addr net.Addr) (net.PacketConn, error) {
+	conn, err := nextDialer.DialContext(ctx, "udp", addr.String())
+	if err != nil {
+		return nil, err
+	}
+	remoteAddr := addr
+	if actualAddr := remoteAddrOf(conn); actualAddr != nil {
+		remoteAddr = actualAddr
+	}
+	return netproxy.NewFakeNetPacketConn(
+		conn.(netproxy.PacketConn),
+		net.UDPAddrFromAddrPort(common.GetUniqueFakeAddrPort()),
+		remoteAddr,
+	), nil
 }
 
 func (d *Dialer) DialContext(ctx context.Context, network, address string) (netproxy.Conn, error) {

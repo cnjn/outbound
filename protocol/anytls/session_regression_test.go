@@ -252,20 +252,13 @@ func TestNewStreamBatchesInitialSessionFrames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newStream(second) error = %v", err)
 	}
-	// A reused session's SYN+address-PSH opening pair is pushed atomically,
-	// so it may leave as one gathered burst instead of two writes; the
-	// contract is the ordered frame sequence.
-	var reuseWire []byte
-	for _, w := range conn.writes[1:] {
-		reuseWire = append(reuseWire, w...)
-	}
-	reusedFrames := decodeTestFrames(t, reuseWire)
-	if len(reusedFrames) != 2 {
-		t.Fatalf("reuse frames = %d, want 2", len(reusedFrames))
+	if len(conn.writes) != 3 {
+		t.Fatalf("writes after reuse = %d, want initial batch plus SYN and PSH", len(conn.writes))
 	}
 	for i, want := range []byte{cmdSYN, cmdPSH} {
-		if reusedFrames[i].cmd != want || reusedFrames[i].sid != second.id {
-			t.Fatalf("reuse frame %d = cmd %d sid %d, want cmd %d sid %d", i, reusedFrames[i].cmd, reusedFrames[i].sid, want, second.id)
+		reusedFrames := decodeTestFrames(t, conn.writes[i+1])
+		if len(reusedFrames) != 1 || reusedFrames[0].cmd != want || reusedFrames[0].sid != second.id {
+			t.Fatalf("reuse write %d = %+v, want cmd %d sid %d", i, reusedFrames, want, second.id)
 		}
 	}
 	_ = s.Close()

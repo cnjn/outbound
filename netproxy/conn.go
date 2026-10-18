@@ -56,6 +56,14 @@ type PacketBatchWriter interface {
 	WriteBatch(items []BatchItem) (n int, err error)
 }
 
+// PacketGSOWriter is an optional extension of PacketConn for transports that
+// support Generic Segmentation Offload (UDP_SEGMENT). When multiple datagrams
+// share the same destination and segment size, callers can transmit them as
+// a single aggregated payload, offloading fragmentation to kernel or NIC.
+type PacketGSOWriter interface {
+	WriteGSO(payload []byte, segmentSize uint16, addr netip.AddrPort) (int, error)
+}
+
 // ReceivedPacket is one complete datagram delivered by an optional
 // transport-owned packet receiver. The receiver owns the packet after a
 // handler accepts it and must call Release exactly once.
@@ -248,7 +256,7 @@ func (conn *fakeNetPacketConn) SetWriteBuffer(size int) error {
 func (conn *fakeNetPacketConn) SetReadBuffer(size int) error {
 	c, ok := conn.PacketConn.(interface{ SetReadBuffer(int) error })
 	if !ok {
-		return fmt.Errorf("connection doesn't allow setting of send buffer size. Not a *net.UDPConn? : %T", conn.PacketConn)
+		return fmt.Errorf("connection doesn't allow setting of receive buffer size. Not a *net.UDPConn? : %T", conn.PacketConn)
 	}
 	return c.SetReadBuffer(size)
 }

@@ -3,7 +3,8 @@ package anytls
 import (
 	"encoding/binary"
 	"fmt"
-	"os"
+	"math"
+	"net"
 	"time"
 )
 
@@ -38,7 +39,7 @@ const (
 	// other implementations). TestRelayBufferAlignment locks this property
 	// for the common buffer sizes.
 	maxFramePayloadSize = 32768
-	maxUDPPayloadSize   = 65535
+	maxUDPPayloadSize   = math.MaxUint16
 )
 
 // frame defines a packet from or to be multiplexed into a single connection
@@ -66,61 +67,63 @@ func (h rawHeader) Length() uint16 {
 	return binary.BigEndian.Uint16(h[5:])
 }
 
-// writeFrame enqueues one frame on the session writer queue and waits for
-// its flush. Callers are the control paths (dial open, half-close FIN,
-// heartbeats) that must observe the write result synchronously, so unlike
-// stream data writes they block until the frame left the process. Queue
-// ownership of the payload is taken at enqueue; validation errors stay
-// synchronous.
 func writeFrame(session *session, frame frame) (int, error) {
-	confirm := make(chan error, 1)
-	wf, err := session.makeWriterFrame(frame.cmd, frame.sid, frame.data, frame.cmd == cmdPSH, time.Time{}, confirm)
+	return writeFrameWithDeadline(session, frame, time.Time{})
+}
+
+func writeFrameWithDeadline(session *session, frame frame, deadline time.Time) (int, error) {
+	size, err := encodedFrameSize(frame)
 	if err != nil {
 		return 0, err
 	}
-	if err := session.wq.push([]writerFrame{wf}, time.Time{}); err != nil {
-		session.releaseFrame(wf)
+	session.connLock.Lock()
+	if session.closed.Load() {
+		session.connLock.Unlock()
+		return 0, net.ErrClosed
+	}
+	buffer := session.borrowWriteBuf(size)
+	encodeFrame(buffer, frame)
+	if _, err = session.writeConnLockedWithDeadline(buffer, deadline); err != nil {
+		session.connLock.Unlock()
 		return 0, err
 	}
-	if werr := <-confirm; werr != nil {
-		return 0, werr
-	}
+	session.connLock.Unlock()
 	return len(frame.data), nil
 }
 
-// writeFrames pushes a group of frames onto the writer queue atomically —
-// nothing can interleave inside the group — and waits for the group's flush
-// through a completion on its last frame. Used by newStream so the settings/
-// SYN/address-PSH opening and the SYN/address-PSH pair of a reused session
-// each leave as one burst.
 func writeFrames(session *session, frames ...frame) (int, error) {
-	if len(frames) == 0 {
-		return 0, nil
-	}
-	group := make([]writerFrame, 0, len(frames))
+	totalSize := 0
 	totalData := 0
-	for _, fr := range frames {
-		wf, err := session.makeWriterFrame(fr.cmd, fr.sid, fr.data, fr.cmd == cmdPSH, time.Time{}, nil)
+	for _, frame := range frames {
+		size, err := encodedFrameSize(frame)
 		if err != nil {
-			for _, built := range group {
-				session.releaseFrame(built)
-			}
 			return 0, err
 		}
-		group = append(group, wf)
-		totalData += len(fr.data)
+		totalSize += size
+		totalData += len(frame.data)
 	}
-	group[len(group)-1].confirm = make(chan error, 1)
-	confirm := group[len(group)-1].confirm
-	if err := session.wq.push(group, time.Time{}); err != nil {
-		for _, built := range group {
-			session.releaseFrame(built)
-		}
+
+	session.connLock.Lock()
+	if session.closed.Load() {
+		session.connLock.Unlock()
+		return 0, net.ErrClosed
+	}
+	buffer := session.borrowWriteBuf(totalSize)
+	offset := 0
+	for _, frame := range frames {
+		offset += encodeFrame(buffer[offset:], frame)
+	}
+	if _, err := session.writeConnLocked(buffer); err != nil {
+		session.connLock.Unlock()
 		return 0, err
 	}
-	if werr := <-confirm; werr != nil {
-		return 0, werr
+	if session.flusher != nil {
+		if ferr := session.flusher.Flush(); ferr != nil {
+			session.connLock.Unlock()
+			return 0, ferr
+		}
 	}
+	session.connLock.Unlock()
 	return totalData, nil
 }
 
@@ -141,19 +144,15 @@ func encodeFrame(dst []byte, frame frame) int {
 	return headerOverHeadSize + dataLen
 }
 
-// writeGroupChunk bounds one atomic push so a group can always fit the data
-// caps once the queue drains (a group larger than the caps could never be
-// admitted and would deadlock its producer against an idle writer).
-const writeGroupChunk = 128
-
-// writeDataFramesBatch enqueues several datagram payloads as consecutive PSH
-// frames for one stream and returns; the session writer flushes them as one
-// gathered burst (one TLS record batch, one socket write). It exists for the
-// netproxy.PacketBatchWriter path so N datagrams cost one burst instead of
-// N. Sizes must be pre-validated. With a deadline armed the call waits for
-// the flush through a completion on the final frame.
+// writeDataFramesBatch encodes several datagram payloads as consecutive PSH
+// frames for one stream and pushes them with a single TLS write burst (one
+// socket write after the coalescer drains). It exists for the
+// netproxy.PacketBatchWriter path so N datagrams cost one syscall instead
+// of N. Sizes must be pre-validated; deadline semantics match
+// writeConnLockedWithDeadline.
 func writeDataFramesBatch(session *session, sid uint32, datas [][]byte, deadline time.Time) (int, error) {
-	chunks := make([][]byte, 0, len(datas))
+	frames := make([]frame, 0, len(datas))
+	totalSize := 0
 	totalData := 0
 	for _, data := range datas {
 		for written := 0; written < len(data); {
@@ -161,95 +160,56 @@ func writeDataFramesBatch(session *session, sid uint32, datas [][]byte, deadline
 			if end > len(data) {
 				end = len(data)
 			}
-			chunks = append(chunks, data[written:end])
-			totalData += end - written
+			frame := newFrame(cmdPSH, sid)
+			frame.data = data[written:end]
+			size, err := encodedFrameSize(frame)
+			if err != nil {
+				return 0, err
+			}
+			frames = append(frames, frame)
+			totalSize += size
+			totalData += len(frame.data)
 			written = end
 		}
 	}
-	if len(chunks) == 0 {
+	if len(frames) == 0 {
 		return 0, nil
 	}
-	if !deadline.IsZero() && !deadline.After(time.Now()) {
-		return 0, os.ErrDeadlineExceeded
+	session.connLock.Lock()
+	if session.closed.Load() {
+		session.connLock.Unlock()
+		return 0, net.ErrClosed
 	}
-	var confirm chan error
-	if !deadline.IsZero() {
-		confirm = make(chan error, 1)
+	buffer := session.borrowWriteBuf(totalSize)
+	offset := 0
+	for _, frame := range frames {
+		offset += encodeFrame(buffer[offset:], frame)
 	}
-	for start := 0; start < len(chunks); start += writeGroupChunk {
-		end := min(start+writeGroupChunk, len(chunks))
-		group := make([]writerFrame, 0, end-start)
-		for i := start; i < end; i++ {
-			var fc chan error
-			if i == len(chunks)-1 {
-				fc = confirm
-			}
-			wf, err := session.makeWriterFrame(cmdPSH, sid, chunks[i], true, deadline, fc)
-			if err != nil {
-				for _, built := range group {
-					session.releaseFrame(built)
-				}
-				return 0, err
-			}
-			group = append(group, wf)
-		}
-		if err := session.wq.push(group, deadline); err != nil {
-			for _, built := range group {
-				session.releaseFrame(built)
-			}
-			return 0, err
-		}
+	if _, err := session.writeConnLockedWithDeadline(buffer, deadline); err != nil {
+		session.connLock.Unlock()
+		return 0, err
 	}
-	if confirm != nil {
-		if werr := <-confirm; werr != nil {
-			return 0, werr
-		}
-	}
+	session.connLock.Unlock()
 	return totalData, nil
 }
 
-// writeDataFrames splits data into maxFramePayloadSize frames and enqueues
-// them on the session writer queue. Without an armed write deadline the call
-// returns once every frame is queued: the bounded queue preserves TCP-style
-// backpressure while the caller (the relay read loop) proceeds in parallel
-// with the TLS write path. With a deadline armed the call instead waits for
-// the flush through a completion on the final frame, preserving the
-// synchronous deadline contract (Write returns os.ErrDeadlineExceeded when
-// the deadline aborts its own batch).
 func writeDataFrames(session *session, sid uint32, data []byte, deadline time.Time) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
-	if !deadline.IsZero() && !deadline.After(time.Now()) {
-		return 0, os.ErrDeadlineExceeded
-	}
-	var confirm chan error
-	if !deadline.IsZero() {
-		confirm = make(chan error, 1)
-	}
-	for off := 0; off < len(data); {
-		end := off + maxFramePayloadSize
+
+	written := 0
+	for written < len(data) {
+		end := written + maxFramePayloadSize
 		if end > len(data) {
 			end = len(data)
 		}
-		var fc chan error
-		if end >= len(data) {
-			fc = confirm
+		frame := newFrame(cmdPSH, sid)
+		frame.data = data[written:end]
+		if _, err := writeFrameWithDeadline(session, frame, deadline); err != nil {
+			return written, err
 		}
-		wf, err := session.makeWriterFrame(cmdPSH, sid, data[off:end], true, deadline, fc)
-		if err != nil {
-			return 0, err
-		}
-		if err := session.wq.push([]writerFrame{wf}, deadline); err != nil {
-			session.releaseFrame(wf)
-			return 0, err
-		}
-		off = end
+		written = end
 	}
-	if confirm != nil {
-		if werr := <-confirm; werr != nil {
-			return 0, werr
-		}
-	}
-	return len(data), nil
+	return written, nil
 }

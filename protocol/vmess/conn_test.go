@@ -70,3 +70,39 @@ func TestConnDialTargetAddrPortConcurrentSafe(t *testing.T) {
 		t.Fatalf("unexpected resolver call count: got %d want 1", got)
 	}
 }
+
+func TestConnWriteTargetAddrPortMissPathUnmaps(t *testing.T) {
+	t.Helper()
+
+	oldResolveUDPAddr := resolveUDPAddr
+	defer func() {
+		resolveUDPAddr = oldResolveUDPAddr
+	}()
+
+	// net.ResolveUDPAddr keeps the 16-byte ::ffff: form for literal IPv4
+	// targets; the miss path must return the unmapped form it caches, not
+	// the resolver's address.
+	v4mapped := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("[::ffff:192.168.1.2]:53"))
+	resolveUDPAddr = func(network, address string) (*net.UDPAddr, error) {
+		return v4mapped, nil
+	}
+
+	c := &Conn{dialTgt: "example.com:8443"}
+
+	got, err := c.writeTargetAddrPort("192.168.1.2:53")
+	if err != nil {
+		t.Fatalf("writeTargetAddrPort miss returned error: %v", err)
+	}
+	if want := netip.MustParseAddrPort("192.168.1.2:53"); got.AddrPort() != want {
+		t.Fatalf("miss path returned %v, want unmapped %v", got.AddrPort(), want)
+	}
+
+	// The cache-hit path must observe the same normalized form.
+	cached, err := c.writeTargetAddrPort("192.168.1.2:53")
+	if err != nil {
+		t.Fatalf("writeTargetAddrPort cache hit returned error: %v", err)
+	}
+	if cached.AddrPort() != got.AddrPort() {
+		t.Fatalf("cache hit returned %v, want %v", cached.AddrPort(), got.AddrPort())
+	}
+}

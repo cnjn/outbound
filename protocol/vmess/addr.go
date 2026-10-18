@@ -74,17 +74,6 @@ var (
 	ErrInvalidMetadata = fmt.Errorf("invalid metadata")
 )
 
-func NewServerMetadata(cmdKey, eAuthID []byte) *Metadata {
-	m := Metadata{
-		Metadata: protocol.Metadata{
-			IsClient: false,
-		},
-	}
-	copy(m.authedCmdKey[:], cmdKey)
-	copy(m.authedEAuthID[:], eAuthID)
-	return &m
-}
-
 func (m *Metadata) AddrLen() int {
 	switch m.Type {
 	case protocol.MetadataTypeIPv4:

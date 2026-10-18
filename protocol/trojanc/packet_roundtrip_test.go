@@ -129,8 +129,12 @@ func TestPacketConnReadFromSmallBufferKeepsNextDatagram(t *testing.T) {
 
 	small := make([]byte, 4)
 	n, _, err := right.ReadFrom(small)
-	if err != nil {
-		t.Fatalf("ReadFrom truncated: %v", err)
+	// The oversized datagram is drained and reported as dropped — the typed
+	// contract (which unwraps to io.ErrShortBuffer), never as silent
+	// truncation or a session-fatal error.
+	var dropped *netproxy.ErrDatagramDropped
+	if !errors.As(err, &dropped) || !errors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("ReadFrom truncated err = %v, want datagram-dropped/ErrShortBuffer", err)
 	}
 	if string(small[:n]) != "ABCD" {
 		t.Fatalf("truncated prefix = %q, want ABCD", small[:n])

@@ -54,11 +54,17 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addr netip.AddrPort, err error) 
 	length := int(binary.BigEndian.Uint16(lengthAndCRLF[:2]))
 	if length > len(p) {
 		// Caller buffer too small: fill it and discard the remainder of the
-		// datagram so the stream stays framed.
+		// datagram so the stream stays framed, then surface the drop —
+		// delivering the truncated bytes as success would corrupt the
+		// datagram silently.
 		if n, err = io.ReadFull(c.Conn, p); err != nil {
 			return 0, netip.AddrPort{}, err
 		}
 		_, _ = io.CopyN(io.Discard, c.Conn, int64(length-len(p)))
+		if addr, err = m.DomainIpMapping(&c.domainIpMapping); err != nil {
+			return 0, netip.AddrPort{}, err
+		}
+		return n, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
 	} else if n, err = io.ReadFull(c.Conn, p[:length]); err != nil {
 		return 0, netip.AddrPort{}, err
 	}

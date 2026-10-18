@@ -350,7 +350,7 @@ func (ps *packetStream) ReadFrom(p []byte) (int, netip.AddrPort, error) {
 		if err := ps.drainLocked(int(length)); err != nil {
 			return 0, addr, err
 		}
-		return 0, addr, io.ErrShortBuffer
+		return 0, addr, netproxy.DatagramDropped(io.ErrShortBuffer)
 	}
 	if err := ps.readFullLocked(p[:length]); err != nil {
 		return 0, addr, err
@@ -402,11 +402,21 @@ func (ps *packetStream) WriteTo(p []byte, addr string) (n int, err error) {
 		return 0, net.ErrClosed
 	}
 
-	if ps.udpWriteAddr.CompareAndSwap(false, true) {
-		tgtAddr, err := socks.ParseAddr(addr)
+	// The first datagram of the stream teaches the server the target
+	// address (connected framing); every later one is unconnected framing
+	// that carries no address. Only a first datagram needs the address to
+	// parse, and it must parse before the mode flips: a malformed address
+	// fails that write without pinning the stream to unconnected framing,
+	// which the server could never parse.
+	var tgtAddr []byte
+	sendAddr := !ps.udpWriteAddr.Load()
+	if sendAddr {
+		tgtAddr, err = socks.ParseAddr(addr)
 		if err != nil {
 			return 0, err
 		}
+		ps.udpWriteAddr.Store(true)
+
 		data := pool.Get(1 + len(tgtAddr) + 2 + len(p))
 		defer pool.Put(data)
 		// connected mode
@@ -456,26 +466,32 @@ func (ps *packetStream) WriteBatch(items []netproxy.BatchItem) (n int, err error
 		return 0, net.ErrClosed
 	}
 
-	first := true
-	datas := make([][]byte, 0, len(items))
-	for _, item := range items {
-		addr := ps.addr
-		if item.Addr != "" {
-			addr = item.Addr
+	// Same contract as WriteTo: decide the addressing mode for this batch
+	// before building any frame, and only after the first address parses,
+	// so a malformed address cannot pin the stream to unconnected framing.
+	sendAddr := !ps.udpWriteAddr.Load()
+	var firstTgtAddr []byte
+	if sendAddr {
+		firstAddr := ps.addr
+		if items[0].Addr != "" {
+			firstAddr = items[0].Addr
 		}
+		firstTgtAddr, err = socks.ParseAddr(firstAddr)
+		if err != nil {
+			return 0, err
+		}
+		ps.udpWriteAddr.Store(true)
+	}
+	datas := make([][]byte, 0, len(items))
+	for i, item := range items {
 		var data []byte
-		if first && ps.udpWriteAddr.CompareAndSwap(false, true) {
-			tgtAddr, err := socks.ParseAddr(addr)
-			if err != nil {
-				return 0, err
-			}
-			data = pool.Get(1 + len(tgtAddr) + 2 + len(item.Data))
+		if i == 0 && sendAddr {
+			data = pool.Get(1 + len(firstTgtAddr) + 2 + len(item.Data))
 			// connected mode
 			data[0] = 1
-			copy(data[1:], tgtAddr)
-			binary.BigEndian.PutUint16(data[1+len(tgtAddr):], uint16(len(item.Data)))
-			copy(data[1+len(tgtAddr)+2:], item.Data)
-			first = false
+			copy(data[1:], firstTgtAddr)
+			binary.BigEndian.PutUint16(data[1+len(firstTgtAddr):], uint16(len(item.Data)))
+			copy(data[1+len(firstTgtAddr)+2:], item.Data)
 		} else {
 			data = pool.Get(2 + len(item.Data))
 			binary.BigEndian.PutUint16(data, uint16(len(item.Data)))

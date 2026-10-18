@@ -17,9 +17,6 @@ func TestSessionWriteBufReleasedOnClose(t *testing.T) {
 	if _, err := stream.Write(payload); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
-	// The write returns at enqueue; the session writeBuf is borrowed when
-	// the writer flushes the batch.
-	sess.wq.waitDrain()
 	if cap(sess.writeBuf) == 0 {
 		t.Fatal("expected session writeBuf after stream write")
 	}

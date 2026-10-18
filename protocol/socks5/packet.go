@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"sync"
@@ -44,25 +45,29 @@ func (pc *PktConn) RegisterPacketReceiver(handler netproxy.PacketReceiveHandler)
 // payload and its source address. Shared by the polling readFrom and the
 // push-mode receiver so the two decode paths cannot drift.
 func parseSocksUdpPayload(data []byte) (payload []byte, from netip.AddrPort, err error) {
+	// Every failure below is a per-datagram event: the datagram was already
+	// drained from the socket and the session stays usable. The typed
+	// datagram-dropped contract tells consumers to drop this one datagram
+	// instead of retiring the endpoint an untyped error would imply.
 	if len(data) < 3 {
-		return nil, netip.AddrPort{}, errors.New("not enough size to get addr")
+		return nil, netip.AddrPort{}, netproxy.DatagramDropped(io.ErrShortBuffer)
 	}
 	if data[2] != 0 {
 		// FRAG != 0 means a fragmented datagram; we never fragment and the
 		// payload of a fragment is not a self-contained datagram, so reject
 		// instead of misparsing the shifted address header.
-		return nil, netip.AddrPort{}, errors.New("fragmented SOCKS UDP datagrams are not supported")
+		return nil, netip.AddrPort{}, netproxy.DatagramDropped(errors.New("fragmented SOCKS UDP datagrams are not supported"))
 	}
 	tgtAddr := socks.SplitAddr(data[3:])
 	if tgtAddr == nil {
-		return nil, netip.AddrPort{}, errors.New("can not get target addr")
+		return nil, netip.AddrPort{}, netproxy.DatagramDropped(errors.New("can not get target addr"))
 	}
 	addrPort, ok := tgtAddr.AddrPort()
 	if !ok {
 		// Domain-shaped reply: keep the legacy resolution path.
 		target, err := net.ResolveUDPAddr("udp", tgtAddr.String())
 		if err != nil {
-			return nil, netip.AddrPort{}, errors.New("wrong target addr")
+			return nil, netip.AddrPort{}, netproxy.DatagramDropped(errors.New("wrong target addr"))
 		}
 		addrPort = target.AddrPort()
 	}

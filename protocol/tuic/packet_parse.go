@@ -224,12 +224,11 @@ func readAddressFromStream(r io.Reader) (*Address, error) {
 			return nil, err
 		}
 		addrLen := int(lenByte[0])
-		var rest []byte
-		if addrLen+2 > 0 {
-			rest = make([]byte, addrLen+2)
-			if _, err := io.ReadFull(r, rest); err != nil {
-				return nil, err
-			}
+		// addrLen is a single byte widened to int, so addrLen+2 is always
+		// positive; read the domain bytes and the port unconditionally.
+		rest := make([]byte, addrLen+2)
+		if _, err := io.ReadFull(r, rest); err != nil {
+			return nil, err
 		}
 		addr.ADDR = make([]byte, 1+addrLen)
 		addr.ADDR[0] = lenByte[0]

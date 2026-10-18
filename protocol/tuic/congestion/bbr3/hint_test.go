@@ -465,3 +465,34 @@ func TestDisabledHintTelemetryStaysZero(t *testing.T) {
 		}
 	}
 }
+
+// TestHintCapUsesDivergenceAwareRTT pins the cap-side mirror of the b141c8a
+// floor protection: once the smoothed RTT rises past minRTT, the hint budget
+// must be sized with the diverged RTT. A minRTT-sized cap would under-fill
+// the pipe at the hint's own rate and cut the srtt-based floor support below
+// the window the path needs.
+func TestHintCapUsesDivergenceAwareRTT(t *testing.T) {
+	h := newHintTraffic(100_000, true)
+	// Sustain traffic until the hint validates and the pipeline is steady.
+	for i := 0; i < 150; i++ {
+		h.step(1000)
+	}
+	if h.s.HintStatus().State != "validated" {
+		t.Fatal("hint did not validate")
+	}
+	// Diverge the path: smoothed RTT triples while minRTT stays 80ms.
+	h.rtt.smoothed = 240 * time.Millisecond
+	h.rtt.latest = 240 * time.Millisecond
+	for i := 0; i < 30; i++ {
+		h.step(1000)
+	}
+	cwnd := h.s.GetCongestionWindow()
+	// The old, minRTT-sized cap for a 100KB/s hint at 80ms and CwndGain 2 is
+	// 100_000 * 0.08 * 2 = 16_000 bytes (observed pinning exactly there on
+	// the pre-fix code). The divergence-aware cap is three times that; the
+	// window must not be pinned to the minRTT-sized budget.
+	minRTTCap := congestion.ByteCount(float64(100_000) * 0.08 * 2.0)
+	if cwnd <= minRTTCap {
+		t.Fatalf("cwnd %d pinned to the minRTT-sized hint cap %d: the cap must size its budget with the diverged RTT", cwnd, minRTTCap)
+	}
+}

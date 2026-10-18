@@ -857,7 +857,7 @@ func TestE2EVlessOverRawTCPRelay(t *testing.T) {
 
 // TestE2EVlessOverTLSRelayTwoUUIDs runs the same 4MiB relay through a real
 // crypto/tls server with two different client UUIDs configured, exercising
-// the coalesce.FlushConn chain end to end, including its half-close forward
+// the transport/tls chain end to end, including its half-close forward
 // (TLS close_notify at the transport layer, since crypto/tls owns the
 // session and the chain has no TCP FIN surface).
 func TestE2EVlessOverTLSRelayTwoUUIDs(t *testing.T) {

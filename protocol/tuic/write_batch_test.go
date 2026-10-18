@@ -94,9 +94,16 @@ func TestWriteBatchSendsPerItemWithTargets(t *testing.T) {
 		t.Fatalf("transport sent %d datagrams, want %d", got, len(items))
 	}
 	for i, item := range items {
-		packet, err := ReadPacket(bytes.NewReader(conn.datagram(i)))
+		// The active lineage only keeps ReadPacketWithHead; read the command
+		// head off the same reader like the removed ReadPacket wrapper did.
+		r := bytes.NewReader(conn.datagram(i))
+		head, err := ReadCommandHead(r)
 		if err != nil {
-			t.Fatalf("datagram %d: ReadPacket: %v", i, err)
+			t.Fatalf("datagram %d: ReadCommandHead: %v", i, err)
+		}
+		packet, err := ReadPacketWithHead(head, r)
+		if err != nil {
+			t.Fatalf("datagram %d: ReadPacketWithHead: %v", i, err)
 		}
 		if string(packet.DATA) != string(item.Data) {
 			t.Fatalf("datagram %d payload = %q, want %q", i, packet.DATA, item.Data)

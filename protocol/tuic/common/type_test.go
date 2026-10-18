@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	outbounderrors "github.com/daeuniverse/outbound/common/errors"
 	"github.com/olicesx/quic-go"
 )
 
@@ -87,7 +88,7 @@ func TestIsTemporaryError(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := IsTemporaryError(tt.err)
+			result := outbounderrors.IsTemporaryError(tt.err)
 			if result != tt.expected {
 				t.Errorf("IsTemporaryError(%v) = %v, want %v", tt.err, result, tt.expected)
 			}
@@ -98,17 +99,17 @@ func TestIsTemporaryError(t *testing.T) {
 func TestIsTemporaryErrorWithWrappedErrors(t *testing.T) {
 	// Test wrapped context errors
 	wrappedDeadline := fmt.Errorf("wrapped: %w", context.DeadlineExceeded)
-	if !IsTemporaryError(wrappedDeadline) {
+	if !outbounderrors.IsTemporaryError(wrappedDeadline) {
 		t.Error("IsTemporaryError should return true for wrapped context.DeadlineExceeded")
 	}
 
 	wrappedCanceled := fmt.Errorf("wrapped: %w", context.Canceled)
-	if !IsTemporaryError(wrappedCanceled) {
+	if !outbounderrors.IsTemporaryError(wrappedCanceled) {
 		t.Error("IsTemporaryError should return true for wrapped context.Canceled")
 	}
 
 	wrappedQueueTimeout := fmt.Errorf("send datagram: %w", quic.ErrDatagramQueueFullTimeout)
-	if !IsTemporaryError(wrappedQueueTimeout) {
+	if !outbounderrors.IsTemporaryError(wrappedQueueTimeout) {
 		t.Error("IsTemporaryError should return true for wrapped datagram send-queue timeout")
 	}
 }

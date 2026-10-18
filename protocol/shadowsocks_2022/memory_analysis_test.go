@@ -202,11 +202,7 @@ func TestSS2022TCPConnCloseReleasesReusableBuffers(t *testing.T) {
 	if conf == nil {
 		t.Fatal("missing ss2022 cipher config")
 	}
-	sg, err := shadowsocks.NewRandomSaltGenerator(conf.SaltLen)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = sg.Close() }()
+	sg := shadowsocks.NewRandomSaltGenerator(conf.SaltLen)
 
 	addr, err := socks5.AddressFromString("203.0.113.10:443")
 	if err != nil {

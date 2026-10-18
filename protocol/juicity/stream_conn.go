@@ -163,3 +163,13 @@ func NewConn(stream quic.Stream, mdata *trojanc.Metadata, closeDeferFn func(), t
 		transportDone: transportDone,
 	}
 }
+
+// ReadBuffered reports immediately-readable stream bytes from the QUIC
+// receive path. It backs write-batching copy loops that must not issue
+// speculative reads or arm deadlines on streams.
+func (c *Conn) ReadBuffered() int {
+	if rb, ok := c.Stream.(interface{ ReadBuffered() int }); ok {
+		return rb.ReadBuffered()
+	}
+	return 0
+}

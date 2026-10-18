@@ -56,10 +56,7 @@ func TestTCPConnFirstWriteDoesNotCommitOnShortWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sg, err := shadowsocks.NewRandomSaltGenerator(conf.SaltLen)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sg := shadowsocks.NewRandomSaltGenerator(conf.SaltLen)
 	underlay := &shortThenFailWriter{}
 	conn := NewTCPConn(underlay, core, sg, addr, nil).(*TCPConn)
 	_, err = conn.Write([]byte("hello"))

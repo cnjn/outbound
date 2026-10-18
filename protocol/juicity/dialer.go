@@ -77,10 +77,9 @@ func NewDialer(nextDialer netproxy.Dialer, header protocol.Header) (netproxy.Dia
 					Uuid:                 id,
 					Password:             header.Password,
 					CongestionController: cc,
-					CWND:                 common.CWNDFromFeature(header.Feature2),
+					CWND:                 brutalTarget,
 					Ctx:                  ctx,
 					Cancel:               cancel,
-					UnderlayAuth:         make(chan *UnderlayAuth, 64),
 				},
 			}
 		}, reservedStreamsCapability),
@@ -142,10 +141,7 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 				if err != nil {
 					return nil, err
 				}
-				key, err := underlayKey(psk)
-				if err != nil {
-					return nil, err
-				}
+				key := underlayKey(psk)
 				innerAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(mdata.Hostname, strconv.Itoa(int(mdata.Port))))
 				if err != nil {
 					return nil, err
@@ -191,11 +187,11 @@ func (d *Dialer) DialContext(ctx context.Context, network string, addr string) (
 	}
 }
 
-func underlayKey(psk []byte) (key *shadowsocks.Key, err error) {
+func underlayKey(psk []byte) *shadowsocks.Key {
 	return &shadowsocks.Key{
 		CipherConf: CipherConf,
 		MasterKey:  psk,
-	}, nil
+	}
 }
 
 func (d *Dialer) DialCmdMsg(ctx context.Context, cmd protocol.MetadataCmd) (c netproxy.Conn, err error) {

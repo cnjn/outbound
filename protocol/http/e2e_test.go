@@ -7,7 +7,8 @@ package http_test
 // via dialer/http's registered constructor).
 //
 // The plain variant exercises the raw HTTP/1.1 CONNECT relay. The https
-// variant goes through transport/tls and its coalesce.FlushConn wrapper; the
+// variant goes through transport/tls and its UnderlyingConnForwarder
+// wrapper; the
 // negotiated ALPN decides between the client's HTTP/1.1 and HTTP/2 CONNECT
 // implementations (protocol/http/conn.go connPool.GetConn), so the server
 // dispatches on ALPN exactly like a normal dual-stack proxy and records what
@@ -451,7 +452,8 @@ func (ps *proxyServer) assertNoConnect(t *testing.T, ch <-chan string, label str
 // newHTTPProxyClientDialer builds the client the way dae does for an
 // http/https subscription link: dialer/http's registered constructor over a
 // direct underlay. For an https link the constructor wraps transport/tls
-// itself, so the client conn chain ends in the coalesce.FlushConn wrapper.
+// itself, so the client conn chain ends in the UnderlyingConnForwarder
+// wrapper.
 func newHTTPProxyClientDialer(t *testing.T, link string) netproxy.Dialer {
 	t.Helper()
 	direct, _ := dialer.NewDirectDialer(&dialer.ExtraOption{}, false)
@@ -498,7 +500,7 @@ func TestE2EHTTPPlainConnectRelay(t *testing.T) {
 }
 
 // TestE2EHTTPSConnectRelayHTTP11 covers the https proxy variant through
-// transport/tls (the coalesce.FlushConn chain) against a server that only
+// transport/tls (the UnderlyingConnForwarder chain) against a server that only
 // advertises http/1.1. The recorded ALPN pins that the client really ran
 // HTTP/1.1 CONNECT over TLS; a client that kept speaking h2 would leave the
 // HTTP/1.1 CONNECT channel empty and fail here.

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/netip"
 	"sync"
@@ -408,6 +409,54 @@ func TestUDPConnReadFromReportsPerDatagramMessageAddress(t *testing.T) {
 		}
 	}
 	if got, want := released.Load(), int32(len(messageAddrs)); got != want {
+		t.Fatalf("Release calls = %d, want %d", got, want)
+	}
+}
+
+// TestUDPConnReadFromSurfacesOversizedDatagramAsDropped pins the
+// datagram-dropped contract: a datagram larger than the caller's buffer is
+// consumed (released) and reported through the typed error unwrapping to
+// io.ErrShortBuffer, so consumers keep the session instead of retiring it.
+func TestUDPConnReadFromSurfacesOversizedDatagramAsDropped(t *testing.T) {
+	var released atomic.Int32
+	u := &udpConn{
+		ID:        1,
+		D:         &frag.Defragger{},
+		ReceiveCh: make(chan *protocol.UDPMessage, 2),
+		target:    "192.0.2.10:5353",
+	}
+	push := func(data string) {
+		u.ReceiveCh <- &protocol.UDPMessage{
+			SessionID: 1,
+			FragCount: 1,
+			Addr:      []byte("198.51.100.8:443"),
+			Data:      []byte(data),
+			Release:   func() { released.Add(1) },
+		}
+	}
+	push("0123456789abcdef")
+	push("ok")
+
+	small := make([]byte, 8)
+	n, _, err := u.ReadFrom(small)
+	var dropped *netproxy.ErrDatagramDropped
+	if !errors.As(err, &dropped) || !errors.Is(err, io.ErrShortBuffer) {
+		t.Fatalf("ReadFrom() err = %v, want datagram-dropped/ErrShortBuffer", err)
+	}
+	if n != len(small) {
+		t.Fatalf("ReadFrom() n = %d, want %d (partial copy)", n, len(small))
+	}
+
+	// The session stays aligned: the next datagram arrives intact.
+	buf := make([]byte, 16)
+	n, _, err = u.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("next ReadFrom() error = %v", err)
+	}
+	if string(buf[:n]) != "ok" {
+		t.Fatalf("next datagram = %q, want ok", buf[:n])
+	}
+	if got, want := released.Load(), int32(2); got != want {
 		t.Fatalf("Release calls = %d, want %d", got, want)
 	}
 }

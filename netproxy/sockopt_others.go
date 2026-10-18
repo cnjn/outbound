@@ -1,4 +1,4 @@
-//go:build !(linux || android || freebsd || openbsd)
+//go:build !linux
 
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
@@ -18,5 +18,14 @@ var SoMarkControl = func(c syscall.RawConn, mark int) error {
 
 // SoMark is replacable.
 var SoMark = func(fd int, mark int) error {
+	return nil
+}
+
+const SafeTCPMaxSeg = 1380
+
+var TCPMaxSegOverride = SafeTCPMaxSeg
+
+// TCPDialControl is replacable.
+var TCPDialControl = func(c syscall.RawConn, mark int, address ...string) error {
 	return nil
 }

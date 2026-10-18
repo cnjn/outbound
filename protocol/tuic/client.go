@@ -219,10 +219,16 @@ func (t *clientImpl) sendAuthentication(quicConn quic.Connection) (err error) {
 	if err != nil {
 		return err
 	}
-	err = stream.Close()
-	if err != nil {
-		return
-	}
+	// The Authenticate command is a one-shot message, and a v5 server stops
+	// reading the stream as soon as it has consumed it (sing-quic's service
+	// does `defer stream.CancelRead(0)`): a STOP_SENDING that reaches this side
+	// before the FIN makes quic-go refuse the Close ("close called for canceled
+	// stream N") and skip the FIN. That is not an authentication result — the
+	// command was written in full, and a server that rejects the credentials
+	// closes the connection with an auth error — so the FIN is best effort.
+	// The reference client discards this Close for the same reason; propagating
+	// it turned a legal peer ordering into a sporadic dial failure.
+	_ = stream.Close()
 	return nil
 }
 

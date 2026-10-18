@@ -40,7 +40,6 @@ type tls12TicketAuth struct {
 	handshakeStatus atomic.Int32
 	sendSaver       bytes.Buffer
 	recvBuffer      bytes.Buffer
-	fastAuth        bool
 	// buffer is the write-direction scratch of Encode; decodeBuffer is the
 	// read-direction scratch of Decode. They must not be shared or the two
 	// directions would race on the same bytes.Buffer state.
@@ -55,9 +54,7 @@ func newTLS12TicketAuth() IObfs {
 
 // newTLS12TicketFastAuth create a tlv1.2_ticket_fastauth object
 func newTLS12TicketFastAuth() IObfs {
-	return &tls12TicketAuth{
-		fastAuth: true,
-	}
+	return newTLS12TicketAuth()
 }
 
 func (t *tls12TicketAuth) SetServerInfo(s *ServerInfo) {
@@ -240,9 +237,6 @@ func (t *tls12TicketAuth) Encode(data []byte) ([]byte, error) {
 }
 
 func (t *tls12TicketAuth) Decode(data []byte) (decodedData []byte, needSendBack bool, err error) {
-	if t.handshakeStatus.Load() == -1 {
-		return data, false, nil
-	}
 	t.decodeBuffer.Reset()
 	if t.handshakeStatus.Load() == 8 {
 		t.recvBuffer.Write(data)

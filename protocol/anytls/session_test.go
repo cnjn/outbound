@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/pool"
 )
 
@@ -290,23 +291,13 @@ func TestStreamWriteSplitsOversizedPayload(t *testing.T) {
 	if n != len(payload) {
 		t.Fatalf("Write() n = %d, want %d", n, len(payload))
 	}
-	// The write is asynchronous through the session writer: wait for the
-	// flush, then check the frame split on the concatenated wire bytes.
-	s.wq.waitDrain()
-	var wire []byte
-	conn.mu.Lock()
-	for _, w := range conn.writes {
-		wire = append(wire, w...)
+	if len(conn.writes) != 2 {
+		t.Fatalf("writes = %d, want 2", len(conn.writes))
 	}
-	conn.mu.Unlock()
-	frames := decodeTestFrames(t, wire)
-	if len(frames) != 2 {
-		t.Fatalf("frames = %d, want 2", len(frames))
-	}
-	if got := len(frames[0].data); got != maxFramePayloadSize {
+	if got := binary.BigEndian.Uint16(conn.writes[0][5:7]); got != maxFramePayloadSize {
 		t.Fatalf("first frame length = %d, want %d", got, maxFramePayloadSize)
 	}
-	if got := len(frames[1].data); got != 10 {
+	if got := binary.BigEndian.Uint16(conn.writes[1][5:7]); got != 10 {
 		t.Fatalf("second frame length = %d, want 10", got)
 	}
 }
@@ -338,6 +329,11 @@ func TestPacketReadFromDrainsShortBuffer(t *testing.T) {
 
 	if _, _, err := packet.ReadFrom(make([]byte, 2)); !errors.Is(err, io.ErrShortBuffer) {
 		t.Fatalf("short ReadFrom() error = %v, want %v", err, io.ErrShortBuffer)
+	} else {
+		var dropped *netproxy.ErrDatagramDropped
+		if !errors.As(err, &dropped) {
+			t.Fatalf("short ReadFrom() error = %v, want the datagram-dropped contract", err)
+		}
 	}
 	buf := make([]byte, 2)
 	n, _, err := packet.ReadFrom(buf)

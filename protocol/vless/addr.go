@@ -34,7 +34,10 @@ func CompleteMetadataFromReader(m *Metadata, first4 []byte, r io.Reader) (err er
 		if _, err = io.ReadFull(r, buf[:1]); err != nil {
 			return err
 		}
-		if _, err = io.ReadFull(r, buf[1:buf[0]]); err != nil {
+		if buf[0] == 0 {
+			return fmt.Errorf("CompleteMetadataFromReader: %w: zero domain length", vmess.ErrInvalidMetadata)
+		}
+		if _, err = io.ReadFull(r, buf[1:1+int(buf[0])]); err != nil {
 			return err
 		}
 		m.Hostname = string(buf[1 : 1+int(buf[0])])

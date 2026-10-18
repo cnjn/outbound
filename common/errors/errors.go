@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 
 	"github.com/olicesx/quic-go"
 )
@@ -88,7 +89,7 @@ func IsStreamExhausted(err error) bool {
 	if err == ErrStreamExhausted {
 		return true
 	}
-	return contains(err.Error(), "too many open streams")
+	return strings.Contains(err.Error(), "too many open streams")
 }
 
 // IsTemporaryError checks if an error is temporary and should not close the connection.
@@ -118,32 +119,4 @@ func IsTemporaryError(err error) bool {
 	}
 
 	return false
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-// contains checks if substr is within s without importing strings package.
-// This is a lightweight implementation for error message checking.
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && indexOf(s, substr) >= 0
-}
-
-// indexOf returns the index of the first occurrence of substr in s,
-// or -1 if substr is not found.
-func indexOf(s, substr string) int {
-	n := len(substr)
-	if n == 0 {
-		return 0
-	}
-	if n > len(s) {
-		return -1
-	}
-	for i := 0; i <= len(s)-n; i++ {
-		if s[i:i+n] == substr {
-			return i
-		}
-	}
-	return -1
 }

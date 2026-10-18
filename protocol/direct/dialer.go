@@ -33,10 +33,6 @@ type DirectDialers struct {
 	Fullcone  netproxy.Dialer
 }
 
-// Dialers is the generation-scoped pair name used by callers that want a
-// snapshot rather than the process-wide lazy globals.
-type Dialers = DirectDialers
-
 // NewDirectDialers builds a generation-scoped pair. It does not modify the
 // exported globals; call InitDirectDialers to publish a pair process-wide.
 func NewDirectDialers(fallbackDNS string) DirectDialers {
@@ -114,8 +110,8 @@ func NewDirectDialerLaddr(lAddr netip.Addr, option Option) netproxy.Dialer {
 		tcpLocalAddr = net.TCPAddrFromAddrPort(netip.AddrPortFrom(lAddr, 0))
 		udpLocalAddr = net.UDPAddrFromAddrPort(netip.AddrPortFrom(lAddr, 0))
 	}
-	tcpDialer := &net.Dialer{LocalAddr: tcpLocalAddr}
-	tcpDialerMptcp := &net.Dialer{LocalAddr: tcpLocalAddr}
+	tcpDialer := &net.Dialer{LocalAddr: tcpLocalAddrOrNil(tcpLocalAddr)}
+	tcpDialerMptcp := &net.Dialer{LocalAddr: tcpLocalAddrOrNil(tcpLocalAddr)}
 	tcpDialerMptcp.SetMultipathTCP(true)
 	d := &directDialer{
 		tcpDialer:      tcpDialer,
@@ -126,6 +122,25 @@ func NewDirectDialerLaddr(lAddr netip.Addr, option Option) netproxy.Dialer {
 	}
 
 	return d
+}
+
+// tcpLocalAddrOrNil and udpLocalAddrOrNil return the address as a net.Addr
+// only when it holds a real value. Assigning a typed-nil *net.TCPAddr or
+// *net.UDPAddr to net.Dialer.LocalAddr keeps the dial wildcard but makes
+// dial errors render the source as "<nil>" ("dial tcp <nil>->host:port:
+// ..."), so the unset case must stay a nil interface.
+func tcpLocalAddrOrNil(addr *net.TCPAddr) net.Addr {
+	if addr == nil {
+		return nil
+	}
+	return addr
+}
+
+func udpLocalAddrOrNil(addr *net.UDPAddr) net.Addr {
+	if addr == nil {
+		return nil
+	}
+	return addr
 }
 
 func (d *directDialer) tryRetry(err error, addr string, callback func()) {
@@ -196,7 +211,7 @@ func (d *directDialer) dialUdp(ctx context.Context, addr string, mark int, ipVer
 			return &directPacketConn{UDPConn: conn, FullCone: true, dialTgt: addr, resolver: resolver, receiver: d.receiver}, nil
 		} else {
 			dialer := net.Dialer{
-				LocalAddr: d.udpLocalAddr,
+				LocalAddr: udpLocalAddrOrNil(d.udpLocalAddr),
 				Resolver:  resolver,
 			}
 			conn, err := dialer.DialContext(ctx, network, addr)
@@ -229,7 +244,7 @@ func (d *directDialer) dialUdp(ctx context.Context, addr string, mark int, ipVer
 				Control: func(network, address string, c syscall.RawConn) error {
 					return netproxy.SoMarkControl(c, mark)
 				},
-				LocalAddr: d.udpLocalAddr,
+				LocalAddr: udpLocalAddrOrNil(d.udpLocalAddr),
 				Resolver:  d.createResolver(mark, fallback),
 			}
 			c, err := dialer.DialContext(ctx, network, addr)
@@ -268,12 +283,8 @@ func (d *directDialer) dialTcp(ctx context.Context, addr string, mark int, ipVer
 	} else {
 		dialer = *d.tcpDialer
 	}
-	if mark != 0 {
-		dialer.Control = func(network, address string, c syscall.RawConn) error {
-			return netproxy.SoMarkControl(c, mark)
-		}
-	} else {
-		dialer.Control = nil
+	dialer.Control = func(network, address string, c syscall.RawConn) error {
+		return netproxy.TCPDialControl(c, mark, address)
 	}
 	dialer.Resolver = d.createResolver(mark, fallback)
 	return dialer.DialContext(ctx, network, addr)

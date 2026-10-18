@@ -114,7 +114,7 @@ func TestOnPacketSentTracksTheStackInFlightAccounting(t *testing.T) {
 	// Acking packet 1: the stack reads priorInFlight before removing the ack.
 	priorInFlight := stackInFlight
 	stackInFlight -= 1200
-	acked := []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: 1200, ReceivedTime: now.Add(80 * time.Millisecond)}}
+	acked := []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: 1200}}
 	s.OnCongestionEventEx(priorInFlight, now.Add(80*time.Millisecond), acked, nil)
 	if s.model.bytesInFlight != stackInFlight {
 		t.Fatalf("after acking 1200: model in-flight = %d, want the stack's %d",

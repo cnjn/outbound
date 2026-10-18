@@ -65,7 +65,7 @@ type TCPConn struct {
 	writeFrame []byte
 
 	bloom *disk_bloom.FilterGroup
-	sg    SaltGenerator
+	sg    *RandomSaltGenerator
 }
 
 type Key struct {
@@ -86,10 +86,7 @@ func NewTCPConn(conn netproxy.Conn, metadata protocol.Metadata, masterKey []byte
 	if conf.NewCipher == nil {
 		return nil, fmt.Errorf("invalid CipherConf")
 	}
-	sg, err := NewRandomSaltGenerator(conf.SaltLen)
-	if err != nil {
-		return nil, err
-	}
+	sg := NewRandomSaltGenerator(conf.SaltLen)
 	// Keep the key connection-owned because both directions use it for the
 	// lifetime of the stream.
 	key := make([]byte, len(masterKey))
@@ -332,7 +329,7 @@ func (c *TCPConn) Write(b []byte) (n int, err error) {
 		defer pool.Put(buf)
 	}
 	if c.cipherWrite == nil {
-		return 0, fmt.Errorf("%v: %w", ErrFailInitCipher, err)
+		return 0, ErrFailInitCipher
 	}
 	sealed := c.seal(buf[offset:], toPack)
 	if _, err = iout.WriteFull(c.Conn, buf[:offset+len(sealed)]); err != nil {

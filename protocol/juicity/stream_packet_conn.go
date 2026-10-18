@@ -53,6 +53,12 @@ func (c *PacketConn) ReadFrom(p []byte) (n int, addrPort netip.AddrPort, err err
 			return 0, netip.AddrPort{}, err
 		}
 		_, _ = io.CopyN(io.Discard, c.Conn, int64(length-len(p)))
+		// Delivering the truncated bytes as success would corrupt the
+		// datagram silently; surface the drop instead.
+		if addrPort, err = m.DomainIpMapping(&c.domainIpMapping); err != nil {
+			return 0, netip.AddrPort{}, fmt.Errorf("ReadFrom AddrPort: %w", err)
+		}
+		return n, addrPort, netproxy.DatagramDropped(io.ErrShortBuffer)
 	} else if n, err = io.ReadFull(c.Conn, p[:length]); err != nil {
 		return 0, netip.AddrPort{}, err
 	}

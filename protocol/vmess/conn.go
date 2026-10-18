@@ -22,7 +22,11 @@ var resolveUDPAddr = net.ResolveUDPAddr
 
 const (
 	MaxChunkSize = 1 << 14
-	MaxUDPSize   = 1 << 11
+	// MaxUDPSize is retained for API compatibility. It is NOT a read-path cap:
+	// staging UDP reads through a buffer of this size silently dropped every
+	// datagram larger than 2048 bytes regardless of the caller's capacity.
+	// ReadFrom now reads into the caller's buffer instead.
+	MaxUDPSize = 1 << 11
 
 	maxReusableSealFrameSize = 128 << 10
 )
@@ -169,6 +173,32 @@ func GenerateChunkNonce(nonce []byte, size uint32) BytesGenerator {
 	}
 }
 
+// initChunkCodecs derives the chunk-stream codec state shared by every
+// connection direction: the size parser selected by the negotiated options
+// (shake-masked under OptionChunkLengthMasking, plain otherwise), the padding
+// generator (the shake parser under OptionGlobalPadding, plain otherwise),
+// and the nonce generator seeded from the direction IV. The returned encoder
+// and decoder are the same parser instance, so the caller keeps only the one
+// its direction needs; each call yields fresh stateful parsers.
+func initChunkCodecs(options byte, iv []byte, nonceSize int) (sizeEncoder ChunkSizeEncoder, sizeDecoder ChunkSizeDecoder, paddingGen PaddingLengthGenerator, nonceGen BytesGenerator) {
+	if ContainOption(options, OptionChunkLengthMasking) {
+		sizeParser := NewShakeSizeParser(iv)
+		sizeEncoder = sizeParser
+		sizeDecoder = sizeParser
+		if ContainOption(options, OptionGlobalPadding) {
+			paddingGen = sizeParser
+		}
+	} else {
+		sizeEncoder = PlainChunkSizeParser{}
+		sizeDecoder = PlainChunkSizeParser{}
+	}
+	if paddingGen == nil {
+		paddingGen = PlainPaddingGenerator{}
+	}
+	nonceGen = GenerateChunkNonce(iv, uint32(nonceSize))
+	return
+}
+
 // seal packs the b. The overhead is sizeParser.SizeBytes() + auth.Overhead() + paddingSize(no more than maxPadding).
 func (c *Conn) sealFromPool(b []byte) (data []byte) {
 	sizeSize := c.writeChunkSizeParser.SizeBytes()
@@ -217,6 +247,22 @@ func (c *Conn) writeStream(b []byte, preWrite []byte) (n int, err error) {
 }
 
 func (c *Conn) writePacket(b []byte, preWrite []byte) (n int, err error) {
+	// The two-byte chunk length field written in sealFromPool covers
+	// len(b) + AEAD overhead + padding. A near-limit datagram (a jumbo one,
+	// or a smaller one whose packetaddr prefix is already counted into b)
+	// would wrap the uint16 and emit a bogus frame length that desyncs the
+	// stream instead of failing the write; reject it up front, mirroring the
+	// mux path's guard for the same field.
+	if int64(len(b))+int64(c.writeBodyCipher.Overhead())+int64(c.writePaddingGenerator.MaxPaddingLen()) > 0xFFFF {
+		// This one datagram cannot be serialized into the 16-bit chunk
+		// length field, but the session itself stays usable. The typed
+		// datagram-dropped contract (with io.ErrShortBuffer as the cause
+		// for legacy errors.Is consumers) tells the endpoint to drop the
+		// datagram and keep the session; an untyped error reads as a
+		// session failure and retires the endpoint.
+		return 0, fmt.Errorf("vmess: udp datagram of %d bytes exceeds the 16-bit chunk length field: %w",
+			len(b), netproxy.DatagramDropped(io.ErrShortBuffer))
+	}
 	data := c.sealFromPool(b)
 	if preWrite != nil {
 		if _, err = iout.MultiWrite(c.Conn, preWrite, data); err != nil {
@@ -287,18 +333,7 @@ func (c *Conn) WriteReqHeader() (err error) {
 			return
 		}
 
-		if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-			c.writeChunkSizeParser = NewShakeSizeParser(c.requestBodyIV[:])
-			if ContainOption(c.requestOptions, OptionGlobalPadding) {
-				c.writePaddingGenerator = c.writeChunkSizeParser.(PaddingLengthGenerator)
-			}
-		} else {
-			c.writeChunkSizeParser = PlainChunkSizeParser{}
-		}
-		if c.writePaddingGenerator == nil {
-			c.writePaddingGenerator = PlainPaddingGenerator{}
-		}
-		c.writeNonceGenerator = GenerateChunkNonce(c.requestBodyIV[:], uint32(c.writeBodyCipher.NonceSize()))
+		c.writeChunkSizeParser, _, c.writePaddingGenerator, c.writeNonceGenerator = initChunkCodecs(c.requestOptions, c.requestBodyIV[:], c.writeBodyCipher.NonceSize())
 		_, err = c.Conn.Write(header)
 	})
 	return err
@@ -334,19 +369,7 @@ func (c *Conn) initWriteOnce() (encRespHeader []byte, err error) {
 				c.writeInitErr = err
 				return
 			}
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.writeChunkSizeParser = NewShakeSizeParser(c.responseBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.writePaddingGenerator = c.writeChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.writeChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.writePaddingGenerator == nil {
-				c.writePaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.writeNonceGenerator = GenerateChunkNonce(c.responseBodyIV[:], uint32(c.writeBodyCipher.NonceSize()))
+			c.writeChunkSizeParser, _, c.writePaddingGenerator, c.writeNonceGenerator = initChunkCodecs(c.requestOptions, c.responseBodyIV[:], c.writeBodyCipher.NonceSize())
 		}
 	})
 	if err == nil {
@@ -507,19 +530,7 @@ func (c *Conn) read(b []byte) (n int, err error) {
 				return
 			}
 
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.readChunkSizeParser = NewShakeSizeParser(c.responseBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.readPaddingGenerator = c.readChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.readChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.readPaddingGenerator == nil {
-				c.readPaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.readNonceGenerator = GenerateChunkNonce(c.responseBodyIV[:], uint32(c.readBodyCipher.NonceSize()))
+			_, c.readChunkSizeParser, c.readPaddingGenerator, c.readNonceGenerator = initChunkCodecs(c.requestOptions, c.responseBodyIV[:], c.readBodyCipher.NonceSize())
 		} else {
 			// assume that EAuthID has been read
 			buf := pool.Get(26) // len(2) + tag(16) + connection_nonce(8)
@@ -564,19 +575,7 @@ func (c *Conn) read(b []byte) (n int, err error) {
 			if c.readBodyCipher, err = c.NewAEAD(c.requestBodyKey[:]); err != nil {
 				return
 			}
-			if ContainOption(c.requestOptions, OptionChunkLengthMasking) {
-				c.readChunkSizeParser = NewShakeSizeParser(c.requestBodyIV[:])
-
-				if ContainOption(c.requestOptions, OptionGlobalPadding) {
-					c.readPaddingGenerator = c.readChunkSizeParser.(PaddingLengthGenerator)
-				}
-			} else {
-				c.readChunkSizeParser = PlainChunkSizeParser{}
-			}
-			if c.readPaddingGenerator == nil {
-				c.readPaddingGenerator = PlainPaddingGenerator{}
-			}
-			c.readNonceGenerator = GenerateChunkNonce(c.requestBodyIV[:], uint32(c.readBodyCipher.NonceSize()))
+			_, c.readChunkSizeParser, c.readPaddingGenerator, c.readNonceGenerator = initChunkCodecs(c.requestOptions, c.requestBodyIV[:], c.readBodyCipher.NonceSize())
 		}
 	})
 	if err != nil {
@@ -596,7 +595,7 @@ func (c *Conn) read(b []byte) (n int, err error) {
 		if c.metadata.Network == "udp" {
 			c.leftToRead = nil
 			c.indexToRead = 0
-			return 0, io.ErrShortBuffer
+			return 0, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		c.indexToRead += n
 		if c.indexToRead >= len(c.leftToRead) {
@@ -613,11 +612,12 @@ func (c *Conn) read(b []byte) (n int, err error) {
 	n = copy(b, chunk)
 	if n < len(chunk) {
 		if c.metadata.Network == "udp" {
-			// Do not deliver a truncated datagram; dae skips io.ErrShortBuffer
-			// without retiring the UDP endpoint.
+			// Do not deliver a truncated datagram; dae treats the
+			// datagram-dropped contract (and its io.ErrShortBuffer cause)
+			// as a per-datagram event without retiring the UDP endpoint.
 			c.leftToRead = nil
 			c.indexToRead = 0
-			return 0, io.ErrShortBuffer
+			return 0, netproxy.DatagramDropped(io.ErrShortBuffer)
 		}
 		c.leftToRead = chunk
 		c.indexToRead = n
@@ -694,4 +694,21 @@ func (c *Conn) EncryptRespHeaderFromPool(header []byte) (b []byte, err error) {
 	ciph.Seal(buf[18:18], KDF(c.responseBodyIV[:], []byte(KDFSaltConstAEADRespHeaderPayloadIV))[:12], header, nil)
 
 	return buf, nil
+}
+
+// ReadBuffered reports immediately-readable plaintext bytes by delegating
+// to the wrapped conn (the bufio layer owns the userspace queue for TLS
+// transports). It backs write-batching copy loops that must not issue
+// speculative reads or arm deadlines on record-framed streams.
+func (c *Conn) ReadBuffered() int {
+	return netproxy.ReadBuffered(c.Conn)
+}
+
+// UnderlyingConn peels to the wrapped conn so unwrap walks reach the
+// transport socket through the protocol layer.
+func (c *Conn) UnderlyingConn() net.Conn {
+	if u, ok := c.Conn.(netproxy.UnderlyingConnProvider); ok {
+		return u.UnderlyingConn()
+	}
+	return nil
 }

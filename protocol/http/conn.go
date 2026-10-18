@@ -104,7 +104,12 @@ type Conn struct {
 	pendingFirstWrite bytes.Buffer
 }
 
-func (c *Conn) SetDeadline(t time.Time) error {
+// setDeadlineDuringShake applies a deadline change while a lazy handshake may
+// still be pending. When the inner conn is already there it applies the
+// deadline immediately (io.EOF when the conn is gone, a no-op on the
+// multiplexed h2 session); otherwise it queues a closure that replays the
+// deadline on the conn the handshake ends up with.
+func (c *Conn) setDeadlineDuringShake(t time.Time, apply func(conn netproxy.Conn, t time.Time) error) error {
 	c.muFinishShakeFuncs.Lock()
 	defer c.muFinishShakeFuncs.Unlock()
 	if c.finishShakeFuncsApplied {
@@ -115,7 +120,7 @@ func (c *Conn) SetDeadline(t time.Time) error {
 		if h2 {
 			return nil
 		}
-		return conn.SetDeadline(t)
+		return apply(conn, t)
 	}
 	select {
 	case <-c.ctxShakeFinished.Done():
@@ -126,50 +131,24 @@ func (c *Conn) SetDeadline(t time.Time) error {
 		if h2 {
 			return nil
 		}
-		return conn.SetDeadline(t)
+		return apply(conn, t)
 	default:
 	}
 	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
 		if _, h2 := c.currentConn(); h2 {
 			return
 		}
-		_ = conn.SetDeadline(t)
+		_ = apply(conn, t)
 	})
 	return nil
 }
 
+func (c *Conn) SetDeadline(t time.Time) error {
+	return c.setDeadlineDuringShake(t, netproxy.Conn.SetDeadline)
+}
+
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	c.muFinishShakeFuncs.Lock()
-	defer c.muFinishShakeFuncs.Unlock()
-	if c.finishShakeFuncsApplied {
-		conn, h2 := c.currentConn()
-		if conn == nil {
-			return io.EOF
-		}
-		if h2 {
-			return nil
-		}
-		return conn.SetReadDeadline(t)
-	}
-	select {
-	case <-c.ctxShakeFinished.Done():
-		conn, h2 := c.currentConn()
-		if conn == nil {
-			return io.EOF
-		}
-		if h2 {
-			return nil
-		}
-		return conn.SetReadDeadline(t)
-	default:
-	}
-	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-		if _, h2 := c.currentConn(); h2 {
-			return
-		}
-		_ = conn.SetReadDeadline(t)
-	})
-	return nil
+	return c.setDeadlineDuringShake(t, netproxy.Conn.SetReadDeadline)
 }
 
 // WriteDeadlineClosesSession implements netproxy.WriteDeadlineBehavior by
@@ -191,37 +170,7 @@ func (c *Conn) WriteDeadlineClosesSession() bool {
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.muFinishShakeFuncs.Lock()
-	defer c.muFinishShakeFuncs.Unlock()
-	if c.finishShakeFuncsApplied {
-		conn, h2 := c.currentConn()
-		if conn == nil {
-			return io.EOF
-		}
-		if h2 {
-			return nil
-		}
-		return conn.SetWriteDeadline(t)
-	}
-	select {
-	case <-c.ctxShakeFinished.Done():
-		conn, h2 := c.currentConn()
-		if conn == nil {
-			return io.EOF
-		}
-		if h2 {
-			return nil
-		}
-		return conn.SetWriteDeadline(t)
-	default:
-	}
-	c.finishShakeFuncs = append(c.finishShakeFuncs, func(conn netproxy.Conn) {
-		if _, h2 := c.currentConn(); h2 {
-			return
-		}
-		_ = conn.SetWriteDeadline(t)
-	})
-	return nil
+	return c.setDeadlineDuringShake(t, netproxy.Conn.SetWriteDeadline)
 }
 
 func NewConn(ctx context.Context, nextDialer netproxy.Dialer, proxy *HttpProxy, addr string, network string) *Conn {
@@ -992,16 +941,6 @@ func (p *h2ConnsPool) cleanupConnListLocked(addr string, conns *lockedList) {
 	}
 	delete(p.h2ConnsPool, addr)
 	p.releaseAddrDialerLocked(poolKeyBareAddr(addr), addr)
-}
-
-func (p *h2ConnsPool) GetUnderlayConn(c *http2.ClientConn) (netproxy.Conn, error) {
-	p.mu.Lock()
-	ident, ok := p.h2Conn2Ident[c]
-	p.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("GetUnderlayConn: not found")
-	}
-	return ident.ele.Value.(*h2Conn).rawConn, nil
 }
 
 func (p *h2ConnsPool) GetConn(ctx context.Context, nextDialer netproxy.Dialer, addr string, magicNetwork string) (netproxy.Conn, *http2.ClientConn, error) {

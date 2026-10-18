@@ -513,7 +513,7 @@ func getGrpcClientConn(ctx context.Context, tcpDialer netproxy.Dialer, serverNam
 	// allowInsecure?
 	roots, err := systemCertPoolCached()
 	if err != nil {
-		return nil, func() {}, fmt.Errorf("failed to get system certificate pool")
+		return nil, func() {}, fmt.Errorf("failed to get system certificate pool: %w", err)
 	}
 	certOption := grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{ServerName: serverName, RootCAs: roots, InsecureSkipVerify: allowInsecure}))
 

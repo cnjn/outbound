@@ -137,7 +137,3 @@ type BandwidthConfig struct {
 	MaxTx uint64
 	MaxRx uint64
 }
-
-// ObfsPassword, when non-empty, enables Salamander packet obfuscation with
-// this pre-shared key (must match the server-side obfs password).
-type ObfsPassword string

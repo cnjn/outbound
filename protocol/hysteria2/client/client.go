@@ -35,14 +35,6 @@ type Client interface {
 	Close() error
 }
 
-type HandshakeInfo struct {
-	UDPEnabled bool
-	// Tx is the congestion target handed to the sender: the brutal target, or
-	// the bbr3 ceiling hint, in bytes per second. It is 0 when no target
-	// applies (BBR, or bbr3 without a configured bandwidth).
-	Tx uint64
-}
-
 func NewClient(config *Config) (Client, error) {
 	if err := config.verifyAndFill(); err != nil {
 		return nil, err
@@ -88,9 +80,9 @@ func (c *clientImpl) closeExistingLocked() {
 	c.pktConn = nil
 }
 
-func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
+func (c *clientImpl) connect(ctx context.Context) error {
 	if c.closed {
-		return nil, coreErrs.ClosedError{}
+		return coreErrs.ClosedError{}
 	}
 
 	// Close old resources before creating new ones to prevent goroutine and
@@ -100,7 +92,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 
 	pktConn, err := c.config.ConnFactory.New(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if c.config.ObfsPassword != "" {
 		// Salamander obfuscation: wrap the packet conn so every QUIC packet
@@ -108,7 +100,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 		pktConn, err = obfs.WrapPacketConnSalamander(pktConn, []byte(c.config.ObfsPassword))
 		if err != nil {
 			_ = pktConn.Close()
-			return nil, err
+			return err
 		}
 	}
 	serverAddr := quicRemoteAddr(pktConn, c.config.ServerAddr)
@@ -146,7 +138,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	req.Header = make(http.Header)
 	protocol.AuthRequestToHeader(req.Header, protocol.AuthRequest{
@@ -159,7 +151,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
 		_ = pktConn.Close()
-		return nil, coreErrs.ConnectError{Err: err}
+		return coreErrs.ConnectError{Err: err}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != protocol.StatusAuthOK {
@@ -167,7 +159,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
 		_ = pktConn.Close()
-		return nil, coreErrs.AuthError{StatusCode: resp.StatusCode}
+		return coreErrs.AuthError{StatusCode: resp.StatusCode}
 	}
 	// Auth OK
 	authResp := protocol.AuthResponseFromHeader(resp.Header)
@@ -185,7 +177,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 			_ = conn.CloseWithError(closeErrCodeProtocolError, "")
 		}
 		_ = pktConn.Close()
-		return nil, coreErrs.ConnectError{Err: err}
+		return coreErrs.ConnectError{Err: err}
 	}
 	switch ccName {
 	case ccBrutal:
@@ -202,10 +194,7 @@ func (c *clientImpl) connect(ctx context.Context) (*HandshakeInfo, error) {
 	if authResp.UDPEnabled {
 		c.udpSM = newUDPSessionManager(&udpIOImpl{Conn: conn})
 	}
-	return &HandshakeInfo{
-		UDPEnabled: authResp.UDPEnabled,
-		Tx:         actualTx,
-	}, nil
+	return nil
 }
 
 func quicRemoteAddr(pktConn net.PacketConn, fallback net.Addr) net.Addr {
@@ -278,7 +267,7 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 	select {
 	case <-ctx.Done():
 		c.m.Unlock()
-		return nil, errors.New("context deadline exceeded")
+		return nil, ctx.Err()
 	default:
 	}
 	if c.closed {
@@ -286,7 +275,7 @@ func (c *clientImpl) TCP(addr string, ctx context.Context) (netproxy.Conn, error
 		return nil, coreErrs.ClosedError{}
 	}
 	if !c.active() {
-		_, err := c.connect(ctx)
+		err := c.connect(ctx)
 		if err != nil {
 			c.m.Unlock()
 			return nil, err
@@ -355,7 +344,7 @@ func (c *clientImpl) UDP(addr string, ctx context.Context) (netproxy.Conn, error
 	select {
 	case <-ctx.Done():
 		c.m.Unlock()
-		return nil, errors.New("context deadline exceeded")
+		return nil, ctx.Err()
 	default:
 	}
 	if c.closed {
@@ -363,7 +352,7 @@ func (c *clientImpl) UDP(addr string, ctx context.Context) (netproxy.Conn, error
 		return nil, coreErrs.ClosedError{}
 	}
 	if !c.active() {
-		_, err := c.connect(ctx)
+		err := c.connect(ctx)
 		if err != nil {
 			c.m.Unlock()
 			return nil, err
@@ -608,4 +597,16 @@ func (io *udpIOImpl) SendMessage(buf []byte, msg *protocol.UDPMessage) error {
 		return &quic.DatagramTooLargeError{MaxDataLen: int64(len(buf))}
 	}
 	return io.Conn.SendDatagram(buf[:msgN])
+}
+
+// ReadBuffered reports immediately-readable stream bytes from the QUIC
+// receive path. Until the deferred handshake response is consumed the
+// signal reports the stream only, never the pending response bytes, so it
+// stays conservative during fast open. It backs write-batching copy loops
+// that must not issue speculative reads or arm deadlines on streams.
+func (c *tcpConn) ReadBuffered() int {
+	if rb, ok := c.Orig.Stream.(interface{ ReadBuffered() int }); ok {
+		return rb.ReadBuffered()
+	}
+	return 0
 }

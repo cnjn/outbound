@@ -13,7 +13,6 @@ github.com/daeuniverse/outbound/pkg/cert
 github.com/daeuniverse/outbound/pkg/fastrand
 github.com/daeuniverse/outbound/pkg/gun_proto
 github.com/daeuniverse/outbound/pkg/logger
-github.com/daeuniverse/outbound/pkg/zeroalloc/bufio
 github.com/daeuniverse/outbound/pool/bytes
 github.com/daeuniverse/outbound/protocol/hysteria2/errors
 github.com/daeuniverse/outbound/protocol/hysteria2/internal/pmtud

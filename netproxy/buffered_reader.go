@@ -1,12 +1,17 @@
 package netproxy
 
 import (
-	"bufio"
+	"context"
 	"crypto/tls"
+	"errors"
+	"io"
 	"net"
+	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
+
+	zbufio "github.com/daeuniverse/outbound/pkg/zeroalloc/bufio"
 )
 
 // BufferedReaderConn wraps a Conn with a bufio.Reader so that callers using
@@ -43,12 +48,49 @@ type AlreadyReadBuffered interface {
 }
 
 // BufferedReaderConn embeds the original Conn and routes Read through a
-// per-connection bufio.Reader. All other Conn methods (Write, Close, deadlines)
-// pass straight through to the underlying Conn, so Write semantics and any
-// SO_MARK / socket options set on the raw fd are preserved unchanged.
+// per-connection pooled buffered reader. All other Conn methods (Write,
+// deadlines) pass straight through to the underlying Conn, so Write
+// semantics and any SO_MARK / socket options set on the raw fd are
+// preserved unchanged.
+//
+// Buffer lifecycle: the backing array comes from the shared byte pool and is
+// returned exactly once, by whichever of two paths finds the read loop over
+// with no reader left inside reader.Read:
+//
+//   - Read observed a terminal error (EOF, net.ErrClosed, cancellation) and
+//     the buffered window is drained: the read loop's own exit path;
+//   - Close ran with no read in flight and nothing buffered: a connection
+//     torn down without a draining read.
+//
+// Retryable errors (notably read-deadline timeouts) release nothing, so
+// timeout-retry loops keep their buffer. A connection abandoned without Close
+// or a terminal read keeps its buffer for GC, which is the pre-pooling
+// behavior. Every release requires an empty buffered window, so no readable
+// byte is ever discarded. A panic raised inside reader.Read by a misbehaving
+// underlay counts like any other exit: the read is dropped from the in-flight
+// count, but nothing is released until a terminal state exists (a terminal
+// error or Close) with a drained window, so a window the panic left behind is
+// never recycled - not even by a later Close.
+//
+// Read and ReadBuffered share the connection's reader side — bufio.Reader
+// itself is not safe for concurrent use — while Close may be called from any
+// goroutine, including one racing a blocked read: it only closes the underlay
+// and leaves the release to the unblocked reader.
 type BufferedReaderConn struct {
 	Conn
-	reader *bufio.Reader
+	reader *zbufio.Reader
+
+	// mu guards the lifecycle fields below. It is never held across a read,
+	// so a blocked read can never stall Close.
+	mu sync.Mutex
+	// readers counts Read calls currently inside reader.Read; the pooled
+	// buffer is only returned once it is zero.
+	readers int
+	// released records that the pooled buffer has gone back to the pool.
+	released bool
+	// termErr is the terminal error observed by the read path (or net.ErrClosed
+	// recorded by Close). Reads after the release return it unchanged.
+	termErr error
 }
 
 // WriteDeadlineClosesSession forwards the optional destructive write-deadline
@@ -80,7 +122,7 @@ func ForceBufferedReaderConn(c Conn, size int) *BufferedReaderConn {
 	}
 	return &BufferedReaderConn{
 		Conn:   c,
-		reader: bufio.NewReaderSize(readerOf{c}, size),
+		reader: zbufio.NewReaderSize(readerOf{c}, size),
 	}
 }
 
@@ -99,10 +141,112 @@ func alreadyHasReadBuffer(c Conn) bool {
 }
 
 // Read drains buffered bytes first, then refills from the underlying Conn.
-// bufio.Reader handles partial reads internally, so io.ReadFull callers see a
-// single logical read even when the kernel only delivered part of the chunk.
+// The pooled reader handles partial reads internally, so io.ReadFull callers
+// see a single logical read even when the kernel only delivered part of the
+// chunk. A terminal error ends the stream: it is recorded, and the pooled
+// buffer is returned as soon as no other read is still inside the reader (see
+// the type comment for the full lifecycle contract).
 func (b *BufferedReaderConn) Read(p []byte) (int, error) {
-	return b.reader.Read(p)
+	b.mu.Lock()
+	if b.released {
+		err := b.termErr
+		b.mu.Unlock()
+		return 0, err
+	}
+	b.readers++
+	b.mu.Unlock()
+
+	// The exit is deferred so that a panic from the underlying reader cannot
+	// leave the count raised: the count describes reads still inside
+	// reader.Read, and an unwound stack is not one. A stale count would make
+	// every later release impossible (Close included), so restoring it is
+	// correctness, not bookkeeping. The release itself still goes through the
+	// full gate, so the deferred call can only return a drained connection.
+	defer b.exitRead()
+
+	n, err := b.reader.Read(p)
+	if IsTerminalReadErr(err) {
+		b.mu.Lock()
+		if b.termErr == nil {
+			b.termErr = err
+		}
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+// exitRead drops one in-flight read and re-runs the release gate. It is
+// deferred from Read, so it also runs while a panic unwinds; the gate short
+// circuits on the unset terminal error before it touches the reader, which
+// keeps an unwinding reader's window out of the decision.
+func (b *BufferedReaderConn) exitRead() {
+	b.mu.Lock()
+	b.readers--
+	b.releaseIfDrainedLocked()
+	b.mu.Unlock()
+}
+
+// Close closes the underlying Conn and returns the pooled buffer when the
+// connection is already drained and idle. A blocked read is never interrupted
+// for the release: the underlying Close unblocks it and the read path returns
+// the buffer on its way out. If readable bytes are still buffered, the buffer
+// stays with the connection, exactly as the pre-pooling wrapper served them;
+// draining them releases it.
+func (b *BufferedReaderConn) Close() error {
+	b.mu.Lock()
+	if b.termErr == nil {
+		// Reads after the release must report the closed connection, not EOF.
+		b.termErr = net.ErrClosed
+	}
+	b.releaseIfDrainedLocked()
+	b.mu.Unlock()
+	return b.Conn.Close()
+}
+
+// releaseIfDrainedLocked returns the pooled buffer to the pool exactly once,
+// and only when the stream has reached a terminal state, no Read is still
+// inside reader.Read, and no readable byte remains buffered. Checking the
+// reader count before touching the reader keeps Buffered() from racing a
+// goroutine that is mutating the reader's window. The caller must hold mu.
+func (b *BufferedReaderConn) releaseIfDrainedLocked() {
+	if b.released || b.readers != 0 || b.termErr == nil || b.reader.Buffered() != 0 {
+		return
+	}
+	b.released = true
+	b.reader.Put()
+}
+
+// IsTerminalReadErr reports whether err ends a connection's read side, so no
+// future read can still want the read buffer. It is deliberately
+// conservative: deadline-exceeded and other temporary errors are retryable
+// by net.Conn semantics and must not release anything, and a terminal error
+// outside this set (for example ECONNRESET) still releases from Close once
+// the read loop has exited. Transport wrappers that own a pooled read buffer
+// share this classification so their release gates cannot drift apart.
+func IsTerminalReadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.Canceled)
+}
+
+// ReadBuffered reports how many decrypted bytes the buffered layer already
+// holds: every buffered byte is returned by a subsequent Read without
+// touching the network or the wrapped stream, which is exactly the
+// "more data has already arrived" signal write-batching copy loops need.
+// Layers below the buffer (kernel socket) are not this wrapper's to observe;
+// callers combine this with their own socket-state checks. It reports zero
+// once the buffer has been released, and while a read is in flight, when the
+// count could not be read without racing the reader's window.
+func (b *BufferedReaderConn) ReadBuffered() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.released || b.readers != 0 {
+		return 0
+	}
+	return b.reader.Buffered()
 }
 
 // SetReadDeadline is forwarded to the underlying Conn. Note that bufio may

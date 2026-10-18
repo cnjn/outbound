@@ -13,12 +13,11 @@ require (
 	github.com/gorilla/websocket v1.5.0
 	github.com/json-iterator/go v1.1.12
 	github.com/mzz2017/disk-bloom v1.0.1
-	github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
+	github.com/olicesx/quic-go v0.0.0-20261007104854-44a1f9eb14fe
 	github.com/refraction-networking/utls v1.8.2
 	github.com/sagernet/sing v0.6.0
 	github.com/sagernet/sing-shadowtls v0.2.0
 	github.com/samber/oops v1.19.4
-	github.com/seiflotfy/cuckoofilter v0.0.0-20220411075957-e3b120b3f5fb
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.11.1
 	gitlab.com/yawning/chacha20.git v0.0.0-20230427033715-7877545b1b37
@@ -37,7 +36,6 @@ require (
 	github.com/awnumar/memcall v0.0.0-20190816154910-db5ea08008a3 // indirect
 	github.com/awnumar/memguard v0.19.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/dgryski/go-metro v0.0.0-20200812162917-85c65e2d0165 // indirect
 	github.com/ebfe/rc2 v0.0.0-20131011165748-24b9757f5521 // indirect
 	github.com/go-task/slim-sprig/v3 v3.0.0 // indirect
 	github.com/google/pprof v0.0.0-20250208200701-d0013a598941 // indirect
@@ -60,4 +58,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20260910141758-62d80bbebb5b
+replace github.com/olicesx/quic-go => github.com/olicesx/quic-go v0.0.0-20261007104854-44a1f9eb14fe
