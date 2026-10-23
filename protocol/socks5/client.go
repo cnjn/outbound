@@ -50,9 +50,13 @@ func (s *Socks5) DialContext(ctx context.Context, network, addr string) (netprox
 			return nil, fmt.Errorf("[socks5]: dial to %s error: %w", s.addr, err)
 		}
 
-		// Get the proxy addr we should dial.
+		// Get the proxy addr we should dial. DST.ADDR/DST.PORT of a UDP
+		// ASSOCIATE name the address the client will send datagrams from,
+		// not the target, and the server MAY drop datagrams from any other
+		// source (RFC 1928 section 7). The source is unknown here (the relay
+		// may see it through NAT), so send zeros as the RFC requires.
 		var uAddr socks.Addr
-		if uAddr, err = s.connect(ctx, c, addr, socks.CmdUDPAssociate); err != nil {
+		if uAddr, err = s.connect(ctx, c, "0.0.0.0:0", socks.CmdUDPAssociate); err != nil {
 			_ = c.Close()
 			return nil, err
 		}
