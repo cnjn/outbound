@@ -132,6 +132,11 @@ type socks5ServerOptions struct {
 	// connectReply != 0 makes every CONNECT request get this reply code
 	// instead of a real relay (error-path coverage).
 	connectReply byte
+	// strictAssociateSource makes the UDP relay accept datagrams only from
+	// the DST.ADDR/DST.PORT of the UDP ASSOCIATE request, as RFC 1928
+	// section 7 permits ("The server MAY use this information to limit
+	// access to the association"). A zero address or port matches any.
+	strictAssociateSource bool
 }
 
 type socks5TestServer struct {
@@ -144,6 +149,7 @@ type socks5TestServer struct {
 	authPass      string
 	downstreamEOF chan struct{}
 	eofOnce       sync.Once
+	associateDst  []string
 }
 
 // startSocks5Server runs the in-test SOCKS5 server on a real loopback
@@ -178,6 +184,18 @@ func (srv *socks5TestServer) recordMethod(method byte) {
 	srv.mu.Lock()
 	defer srv.mu.Unlock()
 	srv.chosenMethod = method
+}
+
+func (srv *socks5TestServer) recordAssociate(dst string) {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	srv.associateDst = append(srv.associateDst, dst)
+}
+
+func (srv *socks5TestServer) associateRequests() []string {
+	srv.mu.Lock()
+	defer srv.mu.Unlock()
+	return append([]string(nil), srv.associateDst...)
 }
 
 func (srv *socks5TestServer) negotiatedMethod() byte {
@@ -437,14 +455,15 @@ func (srv *socks5TestServer) serveSocks5Conn(t *testing.T, downstream net.Conn) 
 		}()
 		_, _ = io.Copy(downstream, target)
 	case socks5TestCmdUDPAssociate:
-		srv.serveUdpAssociate(t, downstream)
+		srv.recordAssociate(destination)
+		srv.serveUdpAssociate(t, downstream, host, port)
 	}
 }
 
 // serveUdpAssociate replies with a real UDP relay endpoint and relays
 // framed datagrams between the client endpoint and the echo targets it
 // addresses (RFC 1928 section 7).
-func (srv *socks5TestServer) serveUdpAssociate(t *testing.T, control net.Conn) {
+func (srv *socks5TestServer) serveUdpAssociate(t *testing.T, control net.Conn, clientHost string, clientPort int) {
 	t.Helper()
 	relay, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -484,6 +503,9 @@ func (srv *socks5TestServer) serveUdpAssociate(t *testing.T, control net.Conn) {
 			return
 		}
 		if clientAddr == nil {
+			if srv.opts.strictAssociateSource && !associateSourceMatches(from, clientHost, clientPort) {
+				continue // not the endpoint the client declared: drop silently
+			}
 			clientAddr = from
 		}
 		if from.String() == clientAddr.String() {
@@ -504,6 +526,21 @@ func (srv *socks5TestServer) serveUdpAssociate(t *testing.T, control net.Conn) {
 			return
 		}
 	}
+}
+
+// associateSourceMatches reports whether a datagram source matches the
+// DST.ADDR/DST.PORT of a UDP ASSOCIATE request; zeros match anything.
+func associateSourceMatches(from net.Addr, host string, port int) bool {
+	udp, ok := from.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	if ip := net.ParseIP(host); ip == nil || !ip.IsUnspecified() {
+		if ip == nil || !ip.Equal(udp.IP) {
+			return false
+		}
+	}
+	return port == 0 || port == udp.Port
 }
 
 // ---- the client, built exactly the way the consumer (dialer/socks) builds it ----
@@ -712,6 +749,48 @@ func TestE2ESocks5UDPRelayTwoTargets(t *testing.T) {
 		if from.String() != target.String() {
 			t.Fatalf("datagram %d source = %v, want %v", i, from, target.String())
 		}
+	}
+}
+
+// TestE2ESocks5UDPAssociateDeclaresNoSourceAddress: RFC 1928 section 7 makes
+// DST.ADDR/DST.PORT of a UDP ASSOCIATE the address the client will send
+// datagrams from, and a client that does not know it must send zeros. The
+// client cannot know it (the relay may see it through NAT). Sending the
+// target there instead makes a server that limits the association to the
+// declared source drop every datagram.
+func TestE2ESocks5UDPAssociateDeclaresNoSourceAddress(t *testing.T) {
+	target := startUDPEchoTarget(t)
+	srv := startSocks5Server(t, socks5ServerOptions{strictAssociateSource: true})
+	d := newSocks5ClientDialer(t, srv.addr(), "", "")
+
+	pc, err := d.DialContext(deadlineCtx(t), "udp", target.String())
+	if err != nil {
+		t.Fatalf("dial udp (UDP ASSOCIATE): %v", err)
+	}
+	defer pc.Close()
+
+	if got := srv.associateRequests(); len(got) != 1 || got[0] != "0.0.0.0:0" {
+		t.Fatalf("UDP ASSOCIATE DST.ADDR/DST.PORT = %v, want [0.0.0.0:0]", got)
+	}
+
+	packetConn, ok := pc.(netproxy.PacketConn)
+	if !ok {
+		t.Fatalf("DialContext(udp) returned %T, want a PacketConn", pc)
+	}
+	payload := []byte("rfc1928 section 7")
+	if _, err := packetConn.WriteTo(payload, target.String()); err != nil {
+		t.Fatalf("WriteTo: %v", err)
+	}
+	if err := pc.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	buf := make([]byte, 1500)
+	n, _, err := packetConn.ReadFrom(buf)
+	if err != nil {
+		t.Fatalf("ReadFrom through a source-limited relay: %v", err)
+	}
+	if !bytes.Equal(buf[:n], payload) {
+		t.Fatalf("echo = %q, want %q", buf[:n], payload)
 	}
 }
 
